@@ -130,3 +130,13 @@ Compound-file skeleton (everything but stream content), 25 files:
     CLSID/state/times 866, mini FAT 535, headers 500, type/colour 317
   Standard red-black insertion in entry order reproduces 81 of 119 sibling
   trees exactly (another 25 up to colours): not used yet, see docs/IMPROVEMENTS.md.
+
+RTF text against the other bodies (rtf_markup_split; runs into the body stream
+after the plain/HTML bodies, markup into msg_rtfm).  19 of the 23 RTF bodies
+wrap HTML (no separate HTML body in these files), 2 wrap plain text, 2 are
+native RTF:
+  plain bodies alone                                    7,894 coded
+  plain bodies + RTF text, one stream                  21,040 coded
+  plain bodies + RTF runs                              15,959 coded, + markup 3,494 = 19,453
+  archive, attachments zeroed                          97,117 -> 95,538
+  archive, files as they are                        2,595,994 -> 2,595,113

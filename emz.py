@@ -27,7 +27,8 @@ import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time, base64,
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qp import qp_decode, qp_encode, QP_VARIANTS
-from emz_msg import CFB_MAGIC, split as msg_split, skeleton_decode, fill as msg_fill, rtf_split, rtf_join
+from emz_msg import (CFB_MAGIC, split as msg_split, skeleton_decode, fill as msg_fill, rtf_split, rtf_join,
+                     rtf_markup_split, rtf_markup_join)
 
 EMCM = os.environ.get("EMCM", os.path.join(os.path.dirname(os.path.abspath(__file__)), "emcm"))
 MAGIC = b"EMZ4"
@@ -79,7 +80,7 @@ STREAMS = ["path", "kind", "dupref", "diff", "tmpl_r", "tmpl_l",
            "hdr_r", "hdr_l", "sig_r", "sig_l", "addr_r", "xal_r", "subj_r",
            "id_r", "mid1", "mid2", "date", "dsec", "dfmt_r", "rdate",
            "seg", "bodyref", "body", "bin", "raw", "env_r", "env_l", "env_d",
-           "msg_r", "msg_skel", "msg_str", "msg_bin", "msg_prop", "msg_rtf"]
+           "msg_r", "msg_skel", "msg_str", "msg_bin", "msg_prop", "msg_rtf", "msg_rtfm"]
 
 # --------------------------------------------------------------------------
 class Recency:
@@ -1235,7 +1236,8 @@ class Codec:
 
     def code_msg_big(self, path, pid, typ, size, v):
         """Bodies, attachments and other large values: copy of an earlier
-        one, compressed RTF as its text plus token choices, an attached .msg
+        one, compressed RTF as its text runs (into the body stream, after the
+        plain and HTML bodies), markup and token choices, an attached .msg
         or MIME entity by its own models, text into the body stream (UTF-16
         as UTF-8, CRLF as LF when reversible), else bytes into bin."""
         R = self.S["msg_r"]
@@ -1249,7 +1251,12 @@ class Codec:
                 try: r = rtf_split(v)
                 except (IndexError, ValueError, struct.error): r = None
             if r is not None:
-                R.byte(6); self.S["body"].text_end(r[0]); R.uint(len(r[1])); self.S["msg_rtf"].blob(r[1])
+                sp = rtf_markup_split(r[0])
+                if sp is not None:          # text runs next to the other bodies, markup on its own
+                    R.byte(9); R.byte(sp[0]); self.S["msg_rtfm"].text_end(sp[1]); self.S["body"].text_end(sp[2])
+                else:
+                    R.byte(6); self.S["body"].text_end(r[0])
+                R.uint(len(r[1])); self.S["msg_rtf"].blob(r[1])
                 return v
             if pid == 0x3701 and typ == 0x0102:
                 parts = msg_split(v) if v[:8] == CFB_MAGIC else None
@@ -1269,8 +1276,13 @@ class Codec:
         m = R.byte()
         if m == 1: return self.bigs[len(self.bigs) - 1 - R.uint()]
         if m == 0: v = self.S["bin"].blob(size)
-        elif m == 6:
-            t = self.S["body"].until_end(); v = rtf_join(t, self.S["msg_rtf"].blob(R.uint()))
+        elif m in (6, 9):
+            if m == 9:
+                fl = R.byte(); mk = self.S["msg_rtfm"].until_end()
+                t = rtf_markup_join(fl, mk, self.S["body"].until_end())
+            else:
+                t = self.S["body"].until_end()
+            v = rtf_join(t, self.S["msg_rtf"].blob(R.uint()))
         elif m == 7: v = self.code_rfc(path)[1]
         elif m == 8: v = self.code_msg(path)
         else:

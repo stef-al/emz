@@ -477,6 +477,12 @@ class MsgFormat(unittest.TestCase):
             self.assertEqual((t2, emz_msg.rtf_join(t2, ch2)), (text, other))
             mela = emz_msg.struct.pack("<II4sI", len(text) + 12, len(text), b"MELA", 0) + text
             self.assertEqual(emz_msg.rtf_join(*emz_msg.rtf_split(mela)), mela)
+        for t in (b"{\\rtf1\\ansi\\ansicpg1252\\fromtext \\deff0 caf\\'e9 \\{x\\} a\\\\b\\par\r\n\\par\r\nend\\'E9}",
+                  b"{\\rtf1\\ansicpg932 \\'82\\'a0\\par}", b"{\\rtf1 raw \xe9 \\'e9\\par}", b"{\\rtf1\\ansicpg1252 \\'81}", b""):
+            flags, markup, runs = emz_msg.rtf_markup_split(t)
+            self.assertEqual(emz_msg.rtf_markup_join(flags, markup, runs), t)
+        self.assertEqual(emz_msg.rtf_markup_split(b"{\\rtf1\\ansicpg1252 caf\\'e9\\par}")[2], "café\n".encode())
+        self.assertIsNone(emz_msg.rtf_markup_split(b"{\\rtf1 \x01}"))
         self.assertIsNone(emz_msg.rtf_split(c[:-1]))
         self.assertIsNone(emz_msg.rtf_split(c[:-1] + bytes([c[-1] ^ 1])))  # CRC
 

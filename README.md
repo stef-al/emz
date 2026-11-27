@@ -109,8 +109,11 @@ model of its own:
 * **Property streams** (`__properties_version1.0`) are coded as columns
   (tags, flags, values); the size field of a string or binary property is
   predicted from the size of its stream, times from the previous time.
-* **Compressed RTF** is stored decompressed, in the body text stream next
-  to the plain-text body. The exact compressed bytes are rebuilt from the text
+* **Compressed RTF** is stored decompressed and split into its text runs
+  and its markup. The runs (escapes decoded, code page converted to UTF-8,
+  one line per `\par`) go to the body text stream right after the plain-text
+  and HTML bodies, where they repeat them; the markup goes to a stream of its
+  own. The exact compressed bytes are rebuilt from the text
   and one choice per token. The choice is "as predicted" whenever the token
   is what Outlook's own match finder would code. That finder turned out to be
   an LZSS binary search tree in the style of Okumura's LZSS.C (a tree per
@@ -132,15 +135,15 @@ On 25 sample files from the test suites of two open-source `.msg` readers
 
 | Archive of the 25 files | As they are | Attachment bytes zeroed |
 |---|---:|---:|
-| **emz** | **2,595,994** | **97,117** |
+| **emz** | **2,595,113** | **95,538** |
 | emz before `.msg` support (file coded by `emcm` alone) | 2,691,840 | 186,153 |
 | xz -9e (tar) | 2,726,152 | 181,148 |
 | zstd -19 --long=27 (tar) | 2,742,258 | 196,251 |
 
 Attachments (TIFF, PDF, Office files, JPEG, mostly compressed already) are
 83% of the input bytes and 96% of emz's output in the left column. With the
-attachment bytes set to zero, the messages code to 46% less than xz -9e and
-48% less than emz did before. The 23 compressed RTF bodies (120,003 bytes) cost 581 bytes of token
+attachment bytes set to zero, the messages code to 47% less than xz -9e and
+49% less than emz did before. The 23 compressed RTF bodies (120,003 bytes) cost 581 bytes of token
 choices plus their text in the body stream.
 
 ## Quick start

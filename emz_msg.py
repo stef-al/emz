@@ -15,7 +15,7 @@ compressed stream is rebuilt from the text and one choice byte per token:
 tree, `_lzfu_predict`) produces, otherwise an explicit description of the
 token, so streams from any writer are handled.
 """
-import struct, zlib
+import codecs, re, struct, zlib
 
 CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 FREESECT, ENDOFCHAIN, FATSECT, DIFSECT = 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC
@@ -714,3 +714,74 @@ def rtf_join(text, ch):
         p += ln
     payload = bytes(out)
     return struct.pack("<II4sI", len(payload) + 12, n, b"LZFu", rtf_crc(payload)) + payload
+
+
+# ---------------------------------------------------------------------------
+# RTF text against the other bodies
+RTF_TOK = re.compile(rb"\\[a-zA-Z]{1,32}(?:-?[0-9]{1,10})? ?|\\'[0-9a-fA-F]{2}|\\.|\\$|[{}\r\n]|[^\\{}\r\n]+", re.S)
+RTF_PAR = re.compile(rb"\\par(?![a-zA-Z])")
+RTF_CPG = re.compile(rb"\\ansicpg([0-9]{1,5})")
+RTF_HI = re.compile(rb"[\x80-\xff]")
+
+
+def _rtf_codepage(markup):
+    m = RTF_CPG.search(markup)
+    if not m:
+        return None
+    try:
+        return codecs.lookup("cp" + m.group(1).decode()).name
+    except LookupError:
+        return None
+
+
+def rtf_markup_split(text):
+    """Decompressed RTF -> (flags, markup, runs): the text runs (literal
+    characters, escaped braces and backslashes, and lowercase \\'xx escapes
+    of bytes >= 0x80 when the file has no raw 8-bit bytes) each ended by a
+    newline, and the rest with byte 01 where a run was.  Every \\par ends a
+    run, even an empty one, so the runs of an RTF made from plain text are the
+    plain text's lines.  Runs are converted from the RTF's ANSI code page to
+    UTF-8 when that is reversible.  None if the text has 01 bytes."""
+    if b"\x01" in text:
+        return None
+    hi = RTF_HI.search(text) is None
+    markup = bytearray(); runs = []; cur = bytearray()
+    for m in RTF_TOK.finditer(text):
+        t = m.group()
+        if t[0] != 0x5C and t not in (b"{", b"}", b"\r", b"\n"):
+            cur += t; continue
+        if t in (b"\\{", b"\\}", b"\\\\"):
+            cur += t[1:]; continue
+        if hi and len(t) == 4 and t[1] == 0x27 and t[2:] == t[2:].lower() and int(t[2:], 16) >= 0x80:
+            cur.append(int(t[2:], 16)); continue
+        if cur or RTF_PAR.match(t):
+            markup.append(1); runs.append(bytes(cur)); cur = bytearray()
+        markup += t
+    if cur:
+        markup.append(1); runs.append(bytes(cur))
+    flags = 1 if hi else 0
+    cp = _rtf_codepage(bytes(markup)) if hi else None
+    if cp:
+        try:
+            u = [r.decode(cp).encode("utf-8") for r in runs]
+            if all(x.decode("utf-8").encode(cp) == r for x, r in zip(u, runs)) and not any(b"\n" in x for x in u):
+                runs = u; flags |= 2
+        except UnicodeError:
+            pass
+    out = (flags, bytes(markup), b"".join(r + b"\n" for r in runs))
+    return out if rtf_markup_join(*out) == text else None
+
+
+def rtf_markup_join(flags, markup, runs):
+    """Inverse of rtf_markup_split."""
+    rl = runs.split(b"\n")
+    cp = _rtf_codepage(markup) if flags & 2 else None
+    parts = markup.split(b"\x01")
+    out = bytearray(parts[0])
+    for k, part in enumerate(parts[1:]):
+        r = rl[k]
+        if cp: r = r.decode("utf-8").encode(cp)
+        r = r.replace(b"\\", b"\\\\").replace(b"{", b"\\{").replace(b"}", b"\\}")
+        if flags & 1: r = RTF_HI.sub(lambda m: b"\\'%02x" % m.group()[0], r)
+        out += r; out += part
+    return bytes(out)
