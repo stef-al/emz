@@ -1,0 +1,4 @@
+emz on oss_full.corpus (compressed with an -O3 -march=native build of emcm, decompressed with a separately built -O2 generic build)
+compress: 299.05 322.79 1.63 880936
+decompress: 386.44 358.90 1.63 880824
+format: wall_s user_s sys_s peak_rss_kB

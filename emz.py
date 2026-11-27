@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""emz -- structure-aware compressor for e-mail archives (maildir / Enron).
+"""emz -- structure-aware compressor for e-mail archives.
 
-    emz.py c <corpus> <archive>     compress a canonical corpus file
+    emz.py c <corpus> <archive>     compress a corpus file
     emz.py d <archive> <corpus>     decompress
 
-The corpus is a sequence of messages (path, raw RFC-822 bytes).  Every message
-is parsed into header fields + body; each field is coded by a model that knows
-what the field is (dates and Message-IDs as numbers, folded address lists via
-the folding rule, derived fields such as X-From/X-To/X-FileName via the field
-they depend on, ...).  The models emit small decisions and residual literals
-into separate streams that are entropy-coded by the context-mixing back end
-`emcm`.  Messages whose content already occurred elsewhere in the archive are
-coded as references.  Anything that does not fit the expected structure falls
-back to a verbatim path, so the transform is always lossless.
+A corpus is a sequence of messages: `path\\n`, `length\\n`, raw bytes (see
+README).  Every message is parsed into header fields and body.  The field-name
+sequence is coded as a template; each field is coded by a model chosen by its
+name (dates as numbers, Message-IDs as references to earlier messages,
+References/In-Reply-To against the parent message, Subject against the
+parent's subject, Received dates relative to the Date field, address lists via
+their folding rule, Enron's derived X- fields via the fields they repeat, and
+recency lists for everything else).  Bodies are split into MIME parts;
+quoted-printable and base64 parts are decoded when re-encoding reproduces the
+original exactly.  Messages whose content already occurred are coded as a
+reference plus a per-field difference mask.  All decisions go to separate
+streams, which the context-mixing coder `emcm` compresses.  Anything that does
+not fit is stored verbatim, so the result is always byte-exact.
 """
-import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time
+import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time, base64, binascii
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qp import qp_decode, qp_encode
+from qp import qp_decode, qp_encode, QP_VARIANTS
 
 EMCM = os.environ.get("EMCM", os.path.join(os.path.dirname(os.path.abspath(__file__)), "emcm"))
+MAGIC = b"EMZ3"
 
 # --------------------------------------------------------------------------
 # byte streams
@@ -31,7 +36,7 @@ class WStream:
             self.b.append((v & 0x7f) | 0x80); v >>= 7
         self.b.append(v)
     def sint(self, v): self.uint((v << 1) if v >= 0 else ((-v << 1) - 1))
-    def text(self, s): self.b += s; self.b.append(10)          # s: bytes w/o '\n'
+    def text(self, s): self.b += s; self.b.append(10)          # s: bytes without '\n'
     def blob(self, s): self.b += s
 
 class RStream:
@@ -51,18 +56,16 @@ class RStream:
     def blob(self, n):
         s = bytes(self.b[self.p:self.p + n]); self.p += n; return s
 
-STREAMS = ["path", "kind", "dupref", "mid1", "mid2", "date", "dsec", "misc",
-           "from_r", "from_l", "to_r", "to_l", "subj_r", "subj_l", "cc_r", "cc_l",
-           "hdr_r", "hdr_l", "xfrom_r", "xfrom_l", "xto_r", "xto_l", "xcc_r", "xcc_l",
-           "xbcc_r", "xbcc_l", "xal_r", "xal_l", "xfold_r", "xfold_l", "xorig_r", "xorig_l", "xfile_r", "xfile_l",
-           "bodyref", "blen", "body", "raw"]
+STREAMS = ["path", "kind", "dupref", "diff", "tmpl_r", "tmpl_l",
+           "hdr_r", "hdr_l", "sig_r", "sig_l", "addr_r", "xal_r", "subj_r",
+           "id_r", "mid1", "mid2", "date", "dsec", "dfmt_r", "rdate",
+           "seg", "bodyref", "body", "bin", "raw"]
 
 # --------------------------------------------------------------------------
-# field models
 class Recency:
-    """Per-context move-to-front list of recent values.  A value is coded as
-    its rank (one byte) in the list of its context, or as an escape followed
-    by a literal."""
+    """Per-context move-to-front list.  A value is coded as its rank (one byte)
+    in its context's list, or as an escape followed by a newline-terminated
+    literal.  Values must not contain b'\\n'."""
     def __init__(self, k=8):
         self.k = k; self.d = {}
     def code(self, enc, ctx, rs, ls, value=None):
@@ -82,16 +85,14 @@ class Recency:
         if len(lst) > self.k: lst.pop()
         return value
 
-FIELDS = [b"Message-ID", b"Date", b"From", b"To", b"Subject", b"Cc", b"Mime-Version",
-          b"Content-Type", b"Content-Transfer-Encoding", b"Bcc", b"X-From", b"X-To",
-          b"X-cc", b"X-bcc", b"X-Folder", b"X-Origin", b"X-FileName"]
-OPTIONAL = {b"To", b"Cc", b"Bcc"}
-
-MID_RE = re.compile(rb"^<([1-9]\d*|0)\.([1-9]\d*)\.JavaMail\.evans@thyme>$")
-DATE_RE = re.compile(rb"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), ([1-9]\d?) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d\d):(\d\d):(\d\d) ([+-]\d{4}) \(([A-Z]{3})\)$")
+# --------------------------------------------------------------------------
+# dates
 MONTHS = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"]
 DOWS = [b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat", b"Sun"]
-TZ = [(b"-0700", b"PDT"), (b"-0800", b"PST")]
+NAMED_ZONES = {b"UT": 0, b"GMT": 0, b"UTC": 0, b"Z": 0, b"EST": -300, b"EDT": -240, b"CST": -360,
+               b"CDT": -300, b"MST": -420, b"MDT": -360, b"PST": -480, b"PDT": -420}
+DATE_RE = re.compile(rb"^(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun), )?(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+                     rb"(\d{4}) (\d\d):(\d\d)(?::(\d\d))? ([+-]\d{4}|[A-Z]{1,4})(?: (\([^()\n]{1,40}\)))?$")
 
 def days_from_civil(y, m, d):           # proleptic Gregorian -> days since 1970-01-01
     y -= m <= 2
@@ -114,26 +115,66 @@ def civil_from_days(z):
     return y + (m <= 2), m, d
 
 def parse_date(v):
-    """-> (minutes, seconds, tz index) if v is in the canonical format and
-    re-serializes identically, else None."""
+    """RFC 5322 date -> (local minutes, seconds, fmt) if it re-serialises
+    byte-exactly; fmt = (flags, zone, comment)."""
     m = DATE_RE.match(v)
     if not m: return None
-    dow, day, mon, yr, hh, mi, ss, off, tzn = m.groups()
-    try: tzi = TZ.index((off, tzn))
-    except ValueError: return None
-    y, mo, d = int(yr), MONTHS.index(mon) + 1, int(day)
-    if not (1 <= d <= 31) or int(hh) > 23 or int(mi) > 59 or int(ss) > 59: return None
-    days = days_from_civil(y, mo, d)
-    mins = (days * 24 + int(hh)) * 60 + int(mi)
-    res = (mins, int(ss), tzi)
-    return res if format_date(*res) == v else None
+    dow, day, mon, yr, hh, mi, ss, zone, cmt = m.groups()
+    if zone[:1] not in b"+-" and zone not in NAMED_ZONES: return None
+    d = int(day)
+    if not 1 <= d <= 31 or int(hh) > 23 or int(mi) > 59 or (ss is not None and int(ss) > 59): return None
+    if cmt and b"\x00" in cmt: return None
+    days = days_from_civil(int(yr), MONTHS.index(mon) + 1, d)
+    flags = (dow is not None) | (day[:1] == b"0") << 1 | (ss is not None) << 2
+    r = ((days * 24 + int(hh)) * 60 + int(mi), int(ss) if ss else 0, (flags, zone, cmt or b""))
+    return r if format_date(*r) == v else None
 
-def format_date(mins, ss, tzi):
-    days, r = divmod(mins, 1440)
+def format_date(lmins, sec, fmt):
+    flags, zone, cmt = fmt
+    days, r = divmod(lmins, 1440)
     y, mo, d = civil_from_days(days)
-    dow = DOWS[(days + 3) % 7]
-    return b"%s, %d %s %04d %02d:%02d:%02d %s (%s)" % (dow, d, MONTHS[mo - 1], y, r // 60, r % 60, ss,
-                                                       TZ[tzi][0], TZ[tzi][1])
+    out = (DOWS[(days + 3) % 7] + b", ") if flags & 1 else b""
+    out += (b"%02d" % d if flags & 2 else b"%d" % d) + b" " + MONTHS[mo - 1] + b" %04d %02d:%02d" % (y, r // 60, r % 60)
+    if flags & 4: out += b":%02d" % sec
+    out += b" " + zone
+    if cmt: out += b" " + cmt
+    return out
+
+def zone_minutes(zone):
+    if zone[:1] in b"+-":
+        o = int(zone[1:3]) * 60 + int(zone[3:5]); return o if zone[:1] == b"+" else -o
+    return NAMED_ZONES[zone]
+
+def utc_seconds(p):
+    lmins, sec, (flags, zone, cmt) = p
+    return (lmins - zone_minutes(zone)) * 60 + sec
+
+def fmt_bytes(fmt):
+    flags, zone, cmt = fmt
+    return bytes([48 + flags]) + zone + b"\x00" + cmt
+
+def fmt_from_bytes(b):
+    zone, _, cmt = b[1:].partition(b"\x00")
+    return (b[0] - 48, zone, cmt)
+
+# --------------------------------------------------------------------------
+# addresses (JavaMail folding, Enron) and display-name lists
+def fold_addrs(addrs, eol, used=0):
+    out = []
+    for i, a in enumerate(addrs):
+        if i:
+            out.append(b", "); used += 2
+        if used + len(a) > 76:
+            out.append(eol + b"\t"); used = 8
+        out.append(a); used += len(a)
+    return b"".join(out)
+
+def split_addrs(v, eol):
+    if not v: return None
+    u = v.replace(eol + b"\t", b"")
+    if b"\n" in u or b"\r" in u: return None
+    addrs = u.split(b", ")
+    return addrs if fold_addrs(addrs, eol) == v else None
 
 def split_xlist(v):
     """Split a display-name list at top-level ', ' (outside quotes / <>)."""
@@ -150,46 +191,230 @@ def split_xlist(v):
     return ents
 
 def split_xlist_angle(v):
-    """Split only after '>' (Outlook style 'Last, First <...>, ...')."""
     parts = v.split(b">, ")
     return [p + b">" for p in parts[:-1]] + [parts[-1]]
 
-def fold_addrs(addrs, used=0):
-    """JavaMail InternetAddress.toString(): ', '-separated, folded with
-    CRLF TAB before an address that would pass column 76."""
-    out = []
-    for i, a in enumerate(addrs):
-        if i:
-            out.append(b", "); used += 2
-        if used + len(a) > 76:
-            out.append(b"\r\n\t"); used = 8
-        out.append(a); used += len(a)
-    return b"".join(out)
+# --------------------------------------------------------------------------
+# message parsing
+NAME_RE = re.compile(rb"^[!-9;-~]+$")
+ID_FIELDS = (b"message-id", b"in-reply-to", b"references")
+GLOBAL_CTX = {b"mime-version", b"content-type", b"content-transfer-encoding", b"precedence",
+              b"mailing-list", b"list-id", b"list-post", b"list-help", b"list-unsubscribe",
+              b"list-subscribe", b"list-archive", b"list-owner", b"reply-to"}
+SENDER_CTX = {b"autocrypt", b"user-agent", b"x-mailer", b"organization", b"openpgp", b"x-pgp-key",
+              b"face", b"x-face", b"x-operating-system", b"content-language", b"x-pgp-sig", b"x-mailer-version"}
+ADDR_FIELDS = {b"from", b"to", b"cc", b"bcc", b"sender", b"delivered-to", b"return-path", b"x-original-to"}
+VOLATILE = {b"message-id", b"x-folder", b"x-origin", b"x-filename", b"received", b"x-received",
+            b"delivered-to", b"return-path", b"x-original-to", b"status", b"x-status",
+            b"x-mozilla-status", b"x-mozilla-status2", b"x-mozilla-keys", b"x-vm-v5-data",
+            b"x-uid", b"x-keywords", b"envelope-to", b"x-gm-thrid", b"x-gmail-labels", b"x-uidl",
+            b"lines", b"content-length", b"x-ms-reactions"}
+SUBJ_PFX = re.compile(rb"^(?:\s*(?:(?:re|fw|fwd|aw|sv|antw|wg|tr)\s*(?:\[\d+\])?\s*:|\[[^\]\x02]{1,60}\]))*\s*", re.I)
+MID_JAVAMAIL = re.compile(rb"^<([1-9]\d*|0)\.([1-9]\d*)\.JavaMail\.evans@thyme>$")
+MID_TOKEN = re.compile(rb"^<[^<>\s\x02]+>$")
+IDLIST_SPLIT = re.compile(rb"(<[^<>]*>)")
+B64RUN = re.compile(rb"[A-Za-z0-9+/]{16,}={0,2}")
+SIG_TS = re.compile(rb"((?:^|[;\s])[tx]=)([1-9]\d{8,10})(?=[;\s]|$)")
+DOMAIN = re.compile(rb"@([A-Za-z0-9.-]+)")
 
-def split_addrs(v):
-    """Return the address list if v is exactly the folded rendering of it."""
-    if b"\n" in v.replace(b"\r\n\t", b""): return None
-    if v == b"": return None
-    addrs = v.replace(b"\r\n\t", b"").split(b", ")
-    return addrs if fold_addrs(addrs) == v else None
+def is_sig(lname):
+    return (b"dkim" in lname or lname.startswith(b"arc-") or lname.startswith(b"x-google-") or
+            lname.startswith(b"x-gm-") or lname.startswith(b"x-ms-") or lname.startswith(b"x-microsoft-") or
+            lname.startswith(b"x-forefront-") or lname in (b"authentication-results", b"received-spf",
+                                                            b"x-received"))
+
+MODELLED = ({b"message-id", b"in-reply-to", b"references", b"date", b"received", b"x-received", b"subject",
+             b"x-from", b"x-to", b"x-cc", b"x-folder", b"x-origin", b"x-filename"} | ADDR_FIELDS | GLOBAL_CTX | SENDER_CTX)
+
+def is_generic(lname):
+    """True for fields that code_field has no model for (see code_generic)."""
+    return lname not in MODELLED and not is_sig(lname)
+
+ANGLE_ADDR = re.compile(rb"<([^<>\s]+@[^<>\s]+)>")
+GEN_MARK = re.compile(rb"\x06(.)", re.S)
+WS = re.compile(rb"\s+")
+WSP_RUN = re.compile(rb"[ \t]+")
+
+def dkim_body_hash(v, body, eol):
+    """The bh= value a DKIM/ARC signature with tag list v carries if it was
+    computed over this body (RFC 6376 sections 3.4.3-3.4.5 and 3.7), or None
+    if the tags name no supported hash."""
+    t = {}
+    for part in v.split(b";"):
+        k, eq, val = part.partition(b"=")
+        if eq: t[WS.sub(b"", k)] = WS.sub(b"", val)
+    c = t.get(b"c", b"simple/simple").lower().split(b"/")
+    a = t.get(b"a", b"").lower()
+    if a.endswith(b"-sha256"): h = hashlib.sha256
+    elif a.endswith(b"-sha1"): h = hashlib.sha1
+    else: return None
+    b = body if eol == b"\r\n" else body.replace(b"\n", b"\r\n")
+    relaxed = len(c) > 1 and c[1] == b"relaxed"
+    if relaxed:
+        b = b"\r\n".join(WSP_RUN.sub(b" ", ln).rstrip(b" ") for ln in b.split(b"\r\n"))
+    n = len(b)
+    while n >= 2 and b[n - 2:n] == b"\r\n": n -= 2
+    b = b[:n] + b"\r\n" if n or not relaxed else b""
+    if b"l" in t:
+        if not t[b"l"].isdigit(): return None
+        b = b[:int(t[b"l"])]
+    return base64.b64encode(h(b).digest())
+
+def parse_message(msg):
+    """-> (crlf, [(name, sp, value)], body) or None.  Header lines end with
+    the message's line ending; continuation lines stay inside the value."""
+    i = msg.find(b"\n")
+    if i <= 0: return None
+    crlf = msg[i - 1:i] == b"\r"
+    eol = b"\r\n" if crlf else b"\n"
+    j = msg.find(eol + eol)
+    if j < 0: return None
+    hdr, body = msg[:j], msg[j + 2 * len(eol):]
+    if crlf:
+        z = hdr.replace(b"\r\n", b"")
+        if b"\r" in z or b"\n" in z: return None
+    elif b"\r\n" in hdr: return None
+    if b"\x01" in hdr or b"\x02" in hdr: return None
+    fields = []
+    for ln in hdr.split(eol):
+        if ln[:1] in (b" ", b"\t"):
+            if not fields: return None
+            fields[-1][2] += eol + ln
+            continue
+        k = ln.find(b":")
+        if k <= 0 or not NAME_RE.match(ln[:k]): return None
+        rest = ln[k + 1:]
+        if rest[:1] == b" ": fields.append([ln[:k], 0, rest[1:]])
+        else: fields.append([ln[:k], 1, rest])
+    return crlf, fields, body
+
+def render_message(crlf, tmpl, vals, body):
+    eol = b"\r\n" if crlf else b"\n"
+    out = [n + (b": " if sp == 0 else b":") + v for (n, sp), v in zip(tmpl, vals)]
+    return eol.join(out) + eol + eol + body
+
+# --------------------------------------------------------------------------
+# MIME body segmentation
+CT_BOUNDARY = re.compile(rb'boundary\s*=\s*(?:"([^"\r\n]{1,200})"|([^\s;"]{1,200}))', re.I)
+B64_LINE = re.compile(rb"^[A-Za-z0-9+/]*={0,2}$")
+
+def header_params(raw_hdr):
+    """Content-Type / -Transfer-Encoding of a MIME part header block."""
+    ct = cte = b""
+    for m in re.finditer(rb"(?im)^(content-type|content-transfer-encoding)[ \t]*:[ \t]*((?:.*)(?:\r?\n[ \t].*)*)", raw_hdr):
+        if m.group(1).lower() == b"content-type": ct = m.group(2)
+        else: cte = m.group(2).strip().lower()
+    return ct, cte
+
+def b64_try(data, eol):
+    """base64 part body -> (decoded, line length, trailing eols) if it re-encodes exactly."""
+    t = 0; d = data
+    while d.endswith(eol) and t < 3: d = d[:-len(eol)]; t += 1
+    if not d or (eol == b"\n" and b"\r" in d): return None
+    lines = d.split(eol)
+    L = len(lines[0])
+    if L == 0 or L % 4 or any(len(x) != L for x in lines[:-1]) or len(lines[-1]) > L: return None
+    if not all(B64_LINE.match(x) for x in lines): return None
+    try: dec = base64.b64decode(b"".join(lines), validate=True)
+    except (binascii.Error, ValueError): return None
+    if b64_render(dec, L, t, eol) != data: return None
+    return dec, L, t
+
+def b64_render(dec, L, t, eol):
+    e = base64.b64encode(dec)
+    return eol.join(e[i:i + L] for i in range(0, len(e), L)) + eol * t
+
+def mime_segments(ct, cte, body, eol, depth=0):
+    """Split a body into segments (kind, payload):
+       ('T', text), ('Q', (variant, decoded)), ('B', (L, t, decoded))."""
+    m = CT_BOUNDARY.search(ct) if depth < 8 and ct[:10].lower() == b"multipart/" else None
+    if m is None:
+        if cte == b"quoted-printable":
+            trail = body.endswith(b"=" + eol)
+            core = body[:-1 - len(eol)] if trail else body
+            dec = qp_decode(core, eol)
+            if dec is not None:
+                for k, var in enumerate(QP_VARIANTS):
+                    if qp_encode(dec, eol, *var, trail) == body: return [("Q", (k + 8 * trail, dec))]
+        elif cte == b"base64":
+            r = b64_try(body, eol)
+            if r is not None: return [("B", (r[1], r[2], r[0]))]
+        return [("T", body)]
+    delim = eol + b"--" + (m.group(1) or m.group(2))
+    segs = []; pos = 0
+    # the first delimiter may sit at the very start of the body (no preceding line end)
+    at_start = body.startswith(delim[len(eol):])
+    start = 0 if at_start else body.find(delim)
+    if start < 0: return [("T", body)]
+    first = True
+    while True:
+        dl = len(delim) - len(eol) if (first and at_start) else len(delim)
+        first = False
+        # text up to and including the delimiter line
+        line_end = body.find(eol, start + dl)
+        if line_end < 0: segs.append(("T", body[pos:])); return merge_text(segs)
+        is_close = body[start + dl:start + dl + 2] == b"--"
+        segs.append(("T", body[pos:line_end + len(eol)]))
+        pos = line_end + len(eol)
+        if is_close:
+            if pos < len(body): segs.append(("T", body[pos:]))
+            return merge_text(segs)
+        # part header
+        he = body.find(eol + eol, pos - len(eol))
+        nxt = body.find(delim, pos - len(eol))
+        if he < 0 or nxt < 0 or he >= nxt: segs.append(("T", body[pos:])); return merge_text(segs)
+        hdr_end = he + 2 * len(eol)
+        pct, pcte = header_params(body[pos:hdr_end])
+        segs.append(("T", body[pos:hdr_end]))
+        part = body[hdr_end:nxt] if nxt >= hdr_end else b""
+        segs += mime_segments(pct, pcte, part, eol, depth + 1)
+        pos = nxt; start = nxt
+
+def first_delimiter(body, eol):
+    """The boundary named by the body's first line that starts with '--'."""
+    pos = 0 if body.startswith(b"--") else body.find(eol + b"--")
+    if pos < 0: return None
+    if pos or not body.startswith(b"--"): pos += len(eol)
+    end = body.find(eol, pos)
+    return body[pos + 2:end if end >= 0 else len(body)].rstrip(b" \t") or None
+
+def looks_text(b):
+    """Decoded base64 that is mostly printable text (patches, logs, HTML)."""
+    if not b: return True
+    s = b[:4096]
+    bad = sum(1 for c in s if c < 9 or 13 < c < 32 or c == 127)
+    return bad * 100 < len(s)
+
+def merge_text(segs):
+    out = []
+    for s in segs:
+        if s[0] == "T" and out and out[-1][0] == "T": out[-1] = ("T", out[-1][1] + s[1])
+        elif s[0] != "T" or s[1]: out.append(s)
+    return out
+
+def render_segments(segs, eol):
+    out = []
+    for kind, p in segs:
+        if kind == "T": out.append(p)
+        elif kind == "Q": out.append(qp_encode(p[1], eol, *QP_VARIANTS[p[0] & 7], p[0] >= 8))
+        else: out.append(b64_render(p[2], p[0], p[1], eol))
+    return b"".join(out)
 
 # --------------------------------------------------------------------------
 class Codec:
+    PM_M, PM_A, PM_MASK, PM_K = 2**31 - 1, 16807, (1 << 25) - 1, 64
+
     def __init__(self, enc, streams):
         self.enc = enc; self.S = streams
         self.prev_dir = None; self.prev_num = -1
-        self.prev_n2 = 0
-        self.n1_list = []; self.pm_x = 0
-        self.last_date = {}; self.last_date_global = 0
-        self.content = {}          # content hash -> cid
-        self.records = []          # cid -> dict of copied fields
-        self.prev_ref = -1
-        self.bodies = {}           # body hash -> body id
-        self.nbodies = 0
-        self.rc_from = Recency(8); self.rc_to = Recency(8); self.rc_subj = Recency(8); self.rc_cc = Recency(8)
-        self.rc_hdr = Recency(4); self.rc_xfrom = Recency(4); self.rc_xto = Recency(4); self.rc_xcc = Recency(4)
-        self.rc_xbcc = Recency(4); self.rc_name = Recency(4); self.rc_xfold = Recency(8); self.rc_xorig = Recency(4); self.rc_xfile = Recency(4)
-        self.stats = {}
+        self.prev_n2 = 0; self.n1_list = []; self.pm_x = 0
+        self.last_lmins = {}; self.last_lmins_global = 0; self.last_utc = 0
+        self.content = {}; self.records = []; self.prev_ref = -1
+        self.bodies = {}; self.bodylist = []; self.nbodies = 0
+        self.id_events = []; self.id_last = {}; self.msginfo = {}
+        self.rc_tmpl = Recency(254); self.rc_fname = Recency(254)
+        self.rc = Recency(8); self.rc_big = Recency(64); self.rc_small = Recency(4)
+        self.rc_name = Recency(4); self.rc_dfmt = Recency(16)
 
     # ---------------- path ----------------
     def code_path(self, path=None):
@@ -215,122 +440,245 @@ class Codec:
         self.prev_dir, self.prev_num = d, num
         return "%s/%d." % (d, num)
 
-    # ---------------- header parsing (encoder only) ----------------
-    @staticmethod
-    def parse(msg):
-        i = msg.find(b"\r\n\r\n")
-        if i < 0: return None
-        hdr, body = msg[:i], msg[i + 4:]
-        if b"\r" in hdr.replace(b"\r\n", b"") or b"\n" in hdr.replace(b"\r\n", b""): return None
-        if b"\x01" in hdr or b"\x02" in hdr: return None
-        fields = []
-        for ln in hdr.split(b"\r\n"):
-            if ln[:1] in (b" ", b"\t"):
-                if not fields: return None
-                fields[-1][1] += b"\r\n" + ln
-            else:
-                k, sep, v = ln.partition(b": ")
-                if not sep: return None
-                fields.append([k, v])
-        names = [k for k, _ in fields]
-        has_to = b"To" in names; has_cc = b"Cc" in names
-        expect = [f for f in FIELDS if f not in OPTIONAL or (f == b"To" and has_to) or (f in (b"Cc", b"Bcc") and has_cc)]
-        if names != expect: return None
-        F = dict((k, v) for k, v in fields)
-        return F, has_to, has_cc, body
+    # ---------------- helpers ----------------
+    def lit(self, v):                    # header value -> literal-safe bytes
+        return v.replace(self.eol, b"\x02")
+    def unlit(self, v):
+        return v.replace(b"\x02", self.eol)
+
+    def rc_code(self, rc, ctx, rname, lname, v):
+        """Recency-code a header value (with folding)."""
+        if self.enc:
+            rc.code(True, ctx, self.S[rname], self.S[lname], self.lit(v)); return v
+        return self.unlit(rc.code(False, ctx, self.S[rname], self.S[lname]))
+
+    def code_idtoken(self, tok=None):
+        R = self.S["id_r"]
+        if self.enc:
+            i = self.id_last.get(tok)
+            d = len(self.id_events) - i if i is not None else 0
+            R.uint(d)
+            if d == 0: self.S["hdr_l"].text(tok)
+        else:
+            d = R.uint()
+            tok = self.id_events[len(self.id_events) - d] if d else self.S["hdr_l"].text()
+        self.id_last[tok] = len(self.id_events); self.id_events.append(tok)
+        return tok
 
     # ---------------- per message ----------------
     def code_message(self, path=None, msg=None):
         path = self.code_path(path)
         K = self.S["kind"]
+        folder = path.rpartition("/")[0]; user = path.split("/")[0]
         if self.enc:
-            p = self.parse(msg)
-            if p is None:
+            P = parse_message(msg)
+            if P is None:
                 K.byte(2); self.S["raw"].uint(len(msg)); self.S["raw"].blob(msg)
                 return path, msg
-            F, has_to, has_cc, body = p
-            key = hashlib.md5(b"\0".join([F.get(f, b"-") if f in F else b"<none>" for f in FIELDS
-                                          if f not in (b"Message-ID", b"X-Folder", b"X-Origin", b"X-FileName")])
-                              + b"\0" + body).digest()
+            crlf, fields, body = P
+            tmpl = tuple((n, sp) for n, sp, _ in fields); vals = [v for _, _, v in fields]
+            key = hashlib.md5(b"\0".join([bytes([crlf])] + [n + bytes([1 + sp]) + (v if n.lower() not in VOLATILE else b"")
+                                                            for (n, sp), v in zip(tmpl, vals)]) + b"\0" + body).digest()
             cid = self.content.get(key)
-            if cid is not None:
-                K.byte(1)
-                self.S["dupref"].sint(cid - (self.prev_ref + 1))
-                self.prev_ref = cid
-                rec = self.records[cid]
-            else:
-                K.byte(0)
-                rec = None
+            K.byte(crlf * 4 + (1 if cid is not None else 0))
         else:
             t = K.byte()
             if t == 2:
-                n = self.S["raw"].uint(); msg = self.S["raw"].blob(n)
-                return path, msg
-            F = {}
-            if t == 1:
+                n = self.S["raw"].uint(); return path, self.S["raw"].blob(n)
+            crlf = t >> 2; cid = None; tmpl = vals = body = None
+        self.eol = b"\r\n" if crlf else b"\n"
+        self.cur = {"folder": folder, "user": user, "utc": None, "refs": None, "parent": None, "vals": {},
+                    "body": body}
+        copy = (cid is not None) if self.enc else (t & 3) == 1
+        if copy:
+            if self.enc:
+                self.S["dupref"].sint(cid - (self.prev_ref + 1))
+            else:
                 cid = self.prev_ref + 1 + self.S["dupref"].sint()
-                self.prev_ref = cid
-                rec = self.records[cid]
-            else:
-                rec = None
-        d = path.rpartition("/")[0]
-        user = path.split("/")[0]
-        # ---- Message-ID (always coded) ----
-        self.code_mid(F)
-        if rec is None:
+            self.prev_ref = cid
+            rtmpl, rvals, rbody = self.records[cid]
+            tmpl = rtmpl; n = len(tmpl)
+            D = self.S["diff"]
             if self.enc:
-                tmpl = (has_to, has_cc)
+                same = [vals[i] == rvals[i] for i in range(n)]
+                for b in range(0, n, 8):
+                    D.byte(sum(1 << j for j in range(8) if b + j < n and not same[b + j]))
+                out = [rvals[i] if same[i] else None for i in range(n)]
             else:
-                tmpl = None
-            rec = self.code_content(F, d, tmpl, body if self.enc else None)
-            if self.enc:
-                rec = {"mins": rec["mins"]}          # encoder needs only the date state
-                self.content[key] = len(self.records)
-            self.records.append(rec)
+                same = []
+                for b in range(0, n, 8):
+                    x = D.byte(); same += [not (x >> j) & 1 for j in range(8)]
+                out = [rvals[i] if same[i] else None for i in range(n)]
+            todo = [i for i in range(n) if not same[i]]
+            body = rbody
         else:
-            # copy content fields; update date state
-            self.last_date[d] = rec["mins"] if rec["mins"] is not None else self.last_date.get(d, self.last_date_global)
-            if rec["mins"] is not None: self.last_date_global = rec["mins"]
-        # ---- per-copy fields ----
-        F[b"X-Folder"] = self.rc_xfold.code(self.enc, d, self.S["xfold_r"], self.S["xfold_l"], F.get(b"X-Folder"))
-        F[b"X-Origin"] = self.rc_xorig.code(self.enc, user, self.S["xorig_r"], self.S["xorig_l"], F.get(b"X-Origin"))
-        F[b"X-FileName"] = self.rc_xfile.code(self.enc, F[b"X-Folder"], self.S["xfile_r"], self.S["xfile_l"], F.get(b"X-FileName"))
+            tmpl = self.code_template(tmpl)
+            n = len(tmpl); out = [None] * n; todo = list(range(n))
+        lnames = [nm.lower() for nm, _ in tmpl]
+        for i in range(n):
+            if out[i] is not None: self.cur["vals"].setdefault(lnames[i], out[i])
+            if out[i] is not None and lnames[i] == b"date" and self.cur["utc"] is None:
+                p = parse_date(out[i])
+                if p: self.cur["utc"] = utc_seconds(p)
+        if copy and self.cur["vals"].get(b"references"):
+            self.cur["refs"] = IDLIST_SPLIT.split(self.cur["vals"][b"references"])[1::2]
+        # coding order: ids, then date and from, then the modelled fields in
+        # template order, then the body, and last the fields without a model
+        # of their own, whose values may refer to all of these (code_generic)
+        early = (b"date", b"from")
+        gen = [i for i in todo if is_generic(lnames[i])]
+        order = ([i for i in todo if lnames[i] in ID_FIELDS] + [i for i in todo if lnames[i] in early] +
+                 [i for i in todo if lnames[i] not in ID_FIELDS and lnames[i] not in early and not is_generic(lnames[i])])
+        for i in order:
+            v = self.code_field(lnames[i], vals[i] if self.enc else None)
+            out[i] = v
+            self.cur["vals"].setdefault(lnames[i], v)
+        if not copy:
+            body = self.code_body(self.cur["vals"].get(b"content-type", b""),
+                                  self.cur["vals"].get(b"content-transfer-encoding", b""), body)
+        if gen:
+            known = self.known_strings(body)
+            for i in gen:
+                v = self.code_generic(lnames[i], vals[i] if self.enc else None, known)
+                out[i] = v
+                self.cur["vals"].setdefault(lnames[i], v)
+        if not self.enc: self.finish_fields(lnames, out, order, body)
+        # bookkeeping shared by encoder and decoder
+        if not copy:
+            if self.enc: self.content[key] = len(self.records)
+            self.records.append((tmpl, out, body))
+        dv = self.cur["vals"].get(b"date")
+        p = parse_date(dv) if dv is not None else None
+        if p:
+            self.last_lmins[folder] = p[0]; self.last_lmins_global = p[0]; self.last_utc = utc_seconds(p)
+        mid = self.cur["vals"].get(b"message-id")
+        if mid is not None and MID_TOKEN.match(mid):
+            s = self.cur["vals"].get(b"subject")
+            self.msginfo[mid] = (SUBJ_PFX.sub(b"", self.lit(s), 1) if s is not None else None, self.cur["refs"])
+        if self.enc: return path, msg
+        return path, render_message(crlf, tmpl, out, body)
+
+    def code_template(self, tmpl=None):
+        S = self.S
         if self.enc:
-            return path, msg
-        # ---- rebuild message ----
-        out = []
-        for f in FIELDS:
-            if f == b"To" and not rec["has_to"]: continue
-            if f in (b"Cc", b"Bcc") and not rec["has_cc"]: continue
-            v = F[f] if f in (b"Message-ID", b"X-Folder", b"X-Origin", b"X-FileName") else rec["F"][f]
-            out.append(f + b": " + v)
-        body = rec["body"]
-        return path, b"\r\n".join(out) + b"\r\n\r\n" + body
+            r = self.rc_tmpl.d.get(0, [])
+            try: k = r.index(tmpl)
+            except ValueError: k = self.rc_tmpl.k
+            S["tmpl_r"].byte(k)
+            if k == self.rc_tmpl.k:
+                S["tmpl_l"].uint(len(tmpl))
+                for nm, sp in tmpl:
+                    self.rc_fname.code(True, 0, S["tmpl_r"], S["tmpl_l"], nm + (b"\x01" if sp else b""))
+            lst = self.rc_tmpl.d.setdefault(0, [])
+        else:
+            lst = self.rc_tmpl.d.setdefault(0, [])
+            k = S["tmpl_r"].byte()
+            if k < self.rc_tmpl.k: tmpl = lst[k]
+            else:
+                n = S["tmpl_l"].uint(); t = []
+                for _ in range(n):
+                    x = self.rc_fname.code(False, 0, S["tmpl_r"], S["tmpl_l"])
+                    t.append((x[:-1], 1) if x.endswith(b"\x01") else (x, 0))
+                tmpl = tuple(t)
+        if k < len(lst): del lst[k]
+        lst.insert(0, tmpl)
+        if len(lst) > self.rc_tmpl.k: lst.pop()
+        return tmpl
 
-    # Message-ID = <N1.N2.JavaMail.evans@thyme>.  N2 is a millisecond clock
-    # (coded as a delta); N1 is the low 25 bits of the JVM's Park-Miller
-    # generator x -> 16807 x mod (2^31-1), which advances once per message:
-    # it is coded as the number of generator steps since the previous message.
-    PM_M, PM_A, PM_MASK, PM_K = 2**31 - 1, 16807, (1 << 25) - 1, 64
+    # ---------------- field models ----------------
+    def code_field(self, ln, v=None):
+        c = self.cur
+        if ln == b"message-id": return self.code_msgid(v)
+        if ln in (b"in-reply-to", b"references"): return self.code_idlist(ln, v)
+        if ln == b"date": return self.code_date(v)
+        if ln in (b"received", b"x-received"): return self.code_received(v)
+        if ln == b"subject": return self.code_subject(v)
+        if ln in ADDR_FIELDS: return self.code_addr(ln, v)
+        if ln == b"x-from":
+            return self.rc_code(self.rc_small, (b"xfrom", c["vals"].get(b"from")), "xal_r", "hdr_l", v)
+        if ln in (b"x-to", b"x-cc"):
+            return self.code_xlist(ln, v, c["vals"].get(b"to" if ln == b"x-to" else b"cc"))
+        if ln == b"x-folder": return self.rc_code(self.rc, (ln, c["folder"]), "hdr_r", "hdr_l", v)
+        if ln == b"x-origin": return self.rc_code(self.rc_small, (ln, c["user"]), "hdr_r", "hdr_l", v)
+        if ln == b"x-filename": return self.rc_code(self.rc_small, (ln, c["vals"].get(b"x-folder")), "hdr_r", "hdr_l", v)
+        if is_sig(ln): return self.code_sig(ln, v)
+        if ln == b"content-type": return self.code_ctype(v)
+        if ln in GLOBAL_CTX: return self.rc_code(self.rc, (ln,), "hdr_r", "hdr_l", v)
+        if ln in SENDER_CTX: return self.rc_code(self.rc_small, (ln, c["vals"].get(b"from")), "hdr_r", "hdr_l", v)
+        raise AssertionError("generic fields are coded by code_generic")
 
-    def code_mid(self, F):
+    def known_strings(self, body):
+        """Values of this message that other header fields often repeat:
+        code letter -> string.  Mail clients cache them in their own headers
+        (Emacs VM's X-VM-v5-Data holds size, line count, date parts, sender,
+        Message-ID, subject and parent ID); mbox writes Content-Length and
+        Lines."""
+        vals = self.cur["vals"]; k = {}
+        def put(code, s):
+            if s and len(s) >= 2 and b"\x06" not in s and b"\n" not in s and b"\r" not in s and s not in k.values():
+                k[code] = s
+        put(b"A", (vals.get(b"message-id") or b"").strip())
+        put(b"B", (vals.get(b"in-reply-to") or b"").strip())
+        if self.cur["refs"]: put(b"C", self.cur["refs"][-1])
+        fr = vals.get(b"from")
+        if fr:
+            fr = fr.replace(self.eol, b"").strip()
+            m = ANGLE_ADDR.search(fr)
+            if m:
+                put(b"D", m.group(1)); put(b"E", fr[:m.start()].strip().strip(b'"').strip())
+            else:
+                put(b"D", fr)
+        s = vals.get(b"subject")
+        if s:
+            s = s.replace(self.eol, b"")
+            put(b"F", s); put(b"G", SUBJ_PFX.sub(b"", s, 1))
+        put(b"H", b"%d" % len(body)); put(b"I", b"%d" % body.count(b"\n"))
+        dv = vals.get(b"date")
+        m = DATE_RE.match(dv) if dv else None
+        if m:
+            put(b"K", b"%s:%s:%s" % (m.group(5), m.group(6), m.group(7)) if m.group(7) else None)
+            put(b"L", m.group(8))
+        alts = sorted(k.items(), key=lambda cs: -len(cs[1]))
+        pat = b"|".join((rb"(?<!\d)" + re.escape(s) + rb"(?!\d)") if s.isdigit() else re.escape(s) for _, s in alts)
+        rx = re.compile(pat + b"|\x06" if pat else b"\x06")
+        return k, {s: c for c, s in k.items()}, rx
+
+    def code_generic(self, ln, v, known):
+        """Fields without a model of their own: move-to-front per (field,
+        folder) over the value in which copies of the known strings are
+        replaced by \\x06 + code letter (a literal \\x06 becomes \\x06\\x06).
+        Such a value often repeats across messages even when the strings in
+        it do not, and the literals left over are much shorter."""
+        k, inv, rx = known
+        ctx = (ln, self.cur["folder"])
+        if self.enc:
+            t = rx.sub(lambda m: b"\x06" + inv.get(m.group(0), b"\x06"), v)
+            self.rc_code(self.rc, ctx, "hdr_r", "hdr_l", t)
+            return v
+        t = self.rc_code(self.rc, ctx, "hdr_r", "hdr_l", None)
+        return GEN_MARK.sub(lambda m: b"\x06" if m.group(1) == b"\x06" else k[m.group(1)], t)
+
+    def code_msgid(self, v=None):
+        """Enron's JavaMail IDs via the Park-Miller generator and the clock;
+        other IDs as tokens (back-references when seen before)."""
         S2 = self.S["mid2"]
         if self.enc:
-            m = MID_RE.match(F[b"Message-ID"])
+            m = MID_JAVAMAIL.match(v)
             if m and int(m.group(1)) < (1 << 31):
                 n1, n2 = int(m.group(1)), int(m.group(2))
-                d = n2 - self.prev_n2; S2.uint(1 + ((d << 1) if d >= 0 else ((-d << 1) - 1)))
+                d = n2 - self.prev_n2; S2.uint(2 + ((d << 1) if d >= 0 else ((-d << 1) - 1)))
                 self.prev_n2 = n2; self.n1_list.append(n1)
-                return
-            S2.uint(0); self.S["misc"].text(F[b"Message-ID"])
-            return
+                self.id_last[v] = len(self.id_events); self.id_events.append(v)
+                return v
+            if MID_TOKEN.match(v):
+                S2.uint(1); return self.code_idtoken(v)
+            S2.uint(0); return self.rc_code(self.rc, (b"message-id",), "hdr_r", "hdr_l", v)
         u = S2.uint()
-        if u == 0:
-            F[b"Message-ID"] = self.S["misc"].text(); return
-        u -= 1; d = (u >> 1) if not (u & 1) else -((u + 1) >> 1)
+        if u == 0: return self.rc_code(self.rc, (b"message-id",), "hdr_r", "hdr_l", None)
+        if u == 1: return self.code_idtoken()
+        u -= 2; d = (u >> 1) if not (u & 1) else -((u + 1) >> 1)
         n2 = self.prev_n2 + d; self.prev_n2 = n2
-        S1 = self.S["mid1"]
-        k = S1.uint()
+        S1 = self.S["mid1"]; k = S1.uint()
         if k == 0:
             n1 = struct.unpack(">I", S1.blob(4))[0]; h = S1.byte()
             self.pm_x = (h << 25) | (n1 & self.PM_MASK)
@@ -338,10 +686,12 @@ class Codec:
             x = self.pm_x
             for _ in range(k): x = (self.PM_A * x) % self.PM_M
             self.pm_x = x; n1 = x & self.PM_MASK
-        F[b"Message-ID"] = b"<%d.%d.JavaMail.evans@thyme>" % (n1, n2)
+        v = b"<%d.%d.JavaMail.evans@thyme>" % (n1, n2)
+        self.id_last[v] = len(self.id_events); self.id_events.append(v)
+        return v
 
     def finish_mid1(self):
-        """Encoder post-pass: code the N1 sequence (needs one value of lookahead)."""
+        """Encoder post-pass for the JavaMail generator stream (needs lookahead)."""
         S1 = self.S["mid1"]; L = self.n1_list; x = 0
         A, M, MASK = self.PM_A, self.PM_M, self.PM_MASK
         for i, n1 in enumerate(L):
@@ -362,51 +712,201 @@ class Codec:
             x = (h << 25) | (n1 & MASK)
             if not (0 < x < M): x = 0
 
-    def code_date(self, v, d):
-        S, S2 = self.S["date"], self.S["dsec"]
-        ref = self.last_date.get(d, self.last_date_global)
+    def code_idlist(self, ln, v=None):
+        """In-Reply-To / References: message-id tokens coded as back-references
+        to earlier IDs; a References list is predicted as the parent's
+        References plus the parent's ID (parent = its last token)."""
+        R = self.S["id_r"]; c = self.cur
+        if self.enc:
+            parts = IDLIST_SPLIT.split(v); toks = parts[1::2]
+            ok = bool(toks) and all(MID_TOKEN.match(t) for t in toks) and b"\x00" not in v
+            R.uint(len(toks) if ok else 0)
+            if not ok: return self.rc_code(self.rc, (ln, c["folder"]), "hdr_r", "hdr_l", v)
+            self.rc_code(self.rc, (b"sep", ln, min(len(toks), 3)), "hdr_r", "hdr_l", b"\x00".join(parts[0::2]))
+        else:
+            n = R.uint()
+            if n == 0: return self.rc_code(self.rc, (ln, c["folder"]), "hdr_r", "hdr_l", None)
+            seps = self.rc_code(self.rc, (b"sep", ln, min(n, 3)), "hdr_r", "hdr_l", None).split(b"\x00")
+            toks = [None] * n
+        n = len(toks)
+        if ln == b"references":
+            toks[-1] = self.code_idtoken(toks[-1])
+            par = self.msginfo.get(toks[-1])
+            pred = par[1] if par is not None and par[1] is not None else []
+            rest = toks[:-1] if self.enc else None
+            if self.enc:
+                hit = len(pred) == n - 1 and pred == rest
+                R.byte(hit)
+            else:
+                hit = R.byte()
+            if hit: toks[:-1] = pred
+            else:
+                for i in range(n - 1): toks[i] = self.code_idtoken(toks[i])
+            c["refs"] = toks
+            if c["parent"] is None: c["parent"] = toks[-1]
+        else:
+            pred = [c["refs"][-1]] if c["refs"] else None
+            if self.enc:
+                hit = pred is not None and toks == pred
+                R.byte(hit)
+            else:
+                hit = R.byte()
+            if hit: toks = list(pred)
+            else:
+                for i in range(n): toks[i] = self.code_idtoken(toks[i])
+            if ln == b"in-reply-to": c["parent"] = toks[0]
+        if self.enc: return v
+        out = [seps[0]]
+        for i, t in enumerate(toks): out += [t, seps[i + 1]]
+        return b"".join(out)
+
+    def code_date(self, v=None):
+        S, S2 = self.S["date"], self.S["dsec"]; c = self.cur
+        ref = self.last_lmins.get(c["folder"], self.last_lmins_global)
         if self.enc:
             p = parse_date(v)
             if p is None:
-                S2.byte(255); self.S["misc"].text(v)
-                return v, None
-            mins, ss, tzi = p
-            S2.byte(ss + 64 * tzi); S.sint(mins - ref)
+                S2.byte(255); self.S["hdr_l"].text(self.lit(v)); return v
+            lmins, sec, fmt = p
+            S2.byte(sec); S.sint(lmins - ref)
+            self.rc_dfmt.code(True, 0, self.S["dfmt_r"], self.S["hdr_l"], fmt_bytes(fmt))
         else:
-            b = S2.byte()
-            if b == 255: return self.S["misc"].text(), None
-            ss, tzi = b % 64, b // 64
-            mins = ref + S.sint()
-            v = format_date(mins, ss, tzi)
-        self.last_date[d] = mins; self.last_date_global = mins
-        return v, mins
+            sec = S2.byte()
+            if sec == 255: return self.unlit(self.S["hdr_l"].text())
+            lmins = ref + S.sint()
+            fmt = fmt_from_bytes(self.rc_dfmt.code(False, 0, self.S["dfmt_r"], self.S["hdr_l"]))
+            p = (lmins, sec, fmt); v = format_date(*p)
+        if c["utc"] is None: c["utc"] = utc_seconds((lmins, sec, fmt))
+        return v
 
-    def code_addrlist(self, v, rc, ctx, rname, lname):
-        """Address list: if it is the canonical folded rendering of its list,
-        code the unfolded list; else code raw value with a marker."""
+    def code_received(self, v=None):
+        """'<route>; <date>': the route by recency/literal, the date as seconds
+        relative to the message's Date."""
+        R = self.S["rdate"]; c = self.cur
+        ref = c["utc"] if c["utc"] is not None else self.last_utc
+        k = c.setdefault("nrecv", 0); c["nrecv"] = k + 1
         if self.enc:
-            addrs = split_addrs(v)
-            lit = b", ".join(addrs) if addrs is not None else b"\x01" + v.replace(b"\r\n", b"\x02")
-            rc.code(True, ctx, self.S[rname], self.S[lname], lit)
+            i = v.rfind(b";")
+            p = None
+            if i >= 0:
+                tail = v[i + 1:]; pre = tail[:len(tail) - len(tail.lstrip())]
+                p = parse_date(tail[len(pre):]) if pre else None
+            if p is None:
+                R.byte(0); return self.rc_code(self.rc, (b"received", k), "hdr_r", "hdr_l", v)
+            R.byte(1)
+            self.rc_code(self.rc, (b"received", k), "hdr_r", "hdr_l", v[:i])
+            self.rc_code(self.rc_small, (b"rpre",), "hdr_r", "hdr_l", pre)
+            R.sint(utc_seconds(p) - ref)
+            self.rc_dfmt.code(True, 1, self.S["dfmt_r"], self.S["hdr_l"], fmt_bytes(p[2]))
             return v
-        lit = rc.code(False, ctx, self.S[rname], self.S[lname])
-        if lit[:1] == b"\x01": return lit[1:].replace(b"\x02", b"\r\n")
-        return fold_addrs(lit.split(b", "))
+        if R.byte() == 0: return self.rc_code(self.rc, (b"received", k), "hdr_r", "hdr_l", None)
+        head = self.rc_code(self.rc, (b"received", k), "hdr_r", "hdr_l", None)
+        pre = self.rc_code(self.rc_small, (b"rpre",), "hdr_r", "hdr_l", None)
+        utc = ref + R.sint()
+        fmt = fmt_from_bytes(self.rc_dfmt.code(False, 1, self.S["dfmt_r"], self.S["hdr_l"]))
+        t = utc + zone_minutes(fmt[1]) * 60
+        return head + b";" + pre + format_date(t // 60, t % 60, fmt)
 
-    def code_text(self, v, rc, ctx, rname, lname):
-        """Free-text header value (may contain folded continuation lines)."""
+    def code_sig(self, ln, v=None):
+        """DKIM/ARC-style fields: a skeleton (tags, selectors, folding) that
+        repeats per signer, plus the random base64 runs and timestamps.  A
+        body hash (bh=) that matches the stored body is not coded at all
+        (mode 2): the decoder leaves a \\x05 placeholder and fills it in once
+        the body is known (finish_sigs)."""
+        R = self.S["sig_r"]; c = self.cur
+        ref = c["utc"] if c["utc"] is not None else self.last_utc
+        fr = c["vals"].get(b"from"); dm = DOMAIN.search(fr) if fr else None
+        ctx = (ln, dm.group(1).lower() if dm else None)
         if self.enc:
-            rc.code(True, ctx, self.S[rname], self.S[lname], v.replace(b"\r\n", b"\x02"))
+            if b"\x03" in v or b"\x04" in v or b"\x05" in v:
+                R.byte(0); return self.rc_code(self.rc_small, (ln,), "sig_r", "sig_l", v)
+            blobs = []; nums = []
+            sk = B64RUN.sub(lambda m: blobs.append(m.group(0)) or b"\x03", v)
+            sk = SIG_TS.sub(lambda m: nums.append(int(m.group(2))) or (m.group(1) + b"\x04"), sk)
+            mode = 1
+            if sk.count(b"bh=\x03") == 1:
+                k = sk.count(b"\x03", 0, sk.index(b"bh=\x03") + 3)
+                if blobs[k] == dkim_body_hash(v, c["body"], self.eol):
+                    mode = 2; del blobs[k]
+            R.byte(mode)
+            self.rc_code(self.rc_small, ctx, "sig_r", "hdr_l", sk)
+            for x in nums: self.S["rdate"].sint(x - ref)
+            for b in blobs: self.S["sig_l"].text(b)
             return v
-        return rc.code(False, ctx, self.S[rname], self.S[lname]).replace(b"\x02", b"\r\n")
+        mode = R.byte()
+        if not mode: return self.rc_code(self.rc_small, (ln,), "sig_r", "sig_l", None)
+        sk = self.rc_code(self.rc_small, ctx, "sig_r", "hdr_l", None)
+        bhp = sk.index(b"bh=\x03") + 3 if mode == 2 else -1
+        out = bytearray()
+        for i, ch in enumerate(sk):
+            if ch == 3: out += b"\x05" if i == bhp else self.S["sig_l"].text()
+            elif ch == 4: out += b"%d" % (ref + self.S["rdate"].sint())
+            else: out.append(ch)
+        return bytes(out)
 
-    def code_xlist(self, v, addrv, rc, rname, lname):
-        """X-To / X-cc: display-name list.  When it has one entry per address
-        of the corresponding To / Cc list, each entry is predicted from the
-        names previously seen with that address; otherwise the whole value is
-        coded against the values previously seen with the same address list."""
-        addrs = split_addrs(addrv) if addrv else None
+    def finish_fields(self, lnames, out, idx, body):
+        """Decoder: fill in what code_sig and code_ctype left to the body."""
+        for i in idx:
+            v = out[i]; ln = lnames[i]
+            if ln == b"content-type" and b"\x06" in v:
+                out[i] = GEN_MARK.sub(lambda m: b"\x06" if m.group(1) == b"\x06" else first_delimiter(body, self.eol), v)
+            elif b"\x05" in v and is_sig(ln):
+                out[i] = v.replace(b"\x05", dkim_body_hash(v, body, self.eol))
+            if self.cur["vals"].get(ln) is v: self.cur["vals"][ln] = out[i]
+
+    def code_ctype(self, v=None):
+        """Content-Type: a multipart boundary that the body's first delimiter
+        line repeats is replaced by \\x06b and taken from the body on decoding
+        (finish_fields); a literal \\x06 is stuffed as \\x06\\x06."""
+        if self.enc:
+            t = v.replace(b"\x06", b"\x06\x06")
+            m = CT_BOUNDARY.search(v)
+            if m and b"\x06" not in v and first_delimiter(self.cur["body"], self.eol) == (m.group(1) or m.group(2)):
+                g = 1 if m.group(1) is not None else 2
+                t = v[:m.start(g)] + b"\x06b" + v[m.end(g):]
+            self.rc_code(self.rc, (b"content-type",), "hdr_r", "hdr_l", t)
+            return v
+        return self.rc_code(self.rc, (b"content-type",), "hdr_r", "hdr_l", None)
+
+    def code_subject(self, v=None):
+        """prefix (Re:, [list]) + base; the base is predicted from the parent
+        message's subject, else from recently seen bases."""
+        R = self.S["subj_r"]; c = self.cur
+        par = self.msginfo.get(c["parent"]) if c["parent"] is not None else None
+        pb = par[0] if par is not None else None
+        if self.enc:
+            lv = self.lit(v); base = SUBJ_PFX.sub(b"", lv, 1); pfx = lv[:len(lv) - len(base)]
+            hit = pb is not None and pb == base
+            R.byte(hit)
+            self.rc_big.code(True, (b"spfx",), self.S["subj_r"], self.S["hdr_l"], pfx)
+            if not hit: self.rc_big.code(True, (b"sbase",), self.S["subj_r"], self.S["hdr_l"], base)
+            return v
+        hit = R.byte()
+        pfx = self.rc_big.code(False, (b"spfx",), self.S["subj_r"], self.S["hdr_l"])
+        base = pb if hit else self.rc_big.code(False, (b"sbase",), self.S["subj_r"], self.S["hdr_l"])
+        return self.unlit(pfx + base)
+
+    def code_addr(self, ln, v=None):
+        R = self.S["addr_r"]; c = self.cur
+        if ln == b"bcc" and c["vals"].get(b"cc") is not None:
+            if self.enc:
+                same = v == c["vals"][b"cc"]; R.byte(same)
+                if same: return v
+            elif R.byte(): return c["vals"][b"cc"]
+        if self.enc:
+            a = split_addrs(v, self.eol)
+            lit = b", ".join(a) if a is not None else b"\x01" + self.lit(v)
+            self.rc.code(True, (ln, c["folder"]), R, self.S["hdr_l"], lit)
+            return v
+        lit = self.rc.code(False, (ln, c["folder"]), R, self.S["hdr_l"])
+        if lit[:1] == b"\x01": return self.unlit(lit[1:])
+        return fold_addrs(lit.split(b", "), self.eol)
+
+    def code_xlist(self, ln, v=None, addrv=None):
+        """Enron X-To / X-cc: one display name per address of To / Cc, each
+        predicted from the names seen earlier with that address."""
         A = self.S["xal_r"]
+        addrs = split_addrs(addrv, self.eol) if addrv else None
         if self.enc:
             if addrs is not None:
                 for mode, splitter in ((1, split_xlist), (2, split_xlist_angle)):
@@ -414,67 +914,60 @@ class Codec:
                     if len(ents) == len(addrs):
                         A.byte(mode)
                         for a, e in zip(addrs, ents):
-                            self.rc_name.code(True, a, A, self.S["xal_l"], e)
+                            self.rc_name.code(True, a, A, self.S["hdr_l"], self.lit(e))
                         return v
             A.byte(0)
-            return self.code_text(v, rc, addrv, rname, lname)
+            return self.rc_code(self.rc_small, (ln, addrv), "xal_r", "hdr_l", v)
         if A.byte():
-            return b", ".join(self.rc_name.code(False, a, A, self.S["xal_l"]) for a in addrs)
-        return self.code_text(None, rc, addrv, rname, lname)
+            return b", ".join(self.unlit(self.rc_name.code(False, a, A, self.S["hdr_l"])) for a in addrs)
+        return self.rc_code(self.rc_small, (ln, addrv), "xal_r", "hdr_l", None)
 
-    def code_content(self, F, d, tmpl, body):
-        enc = self.enc
-        K = self.S["kind"]
-        if enc:
-            has_to, has_cc = tmpl
-            bcc_eq = has_cc and F[b"Bcc"] == F[b"Cc"]
-            K.byte(has_to + 2 * has_cc + 4 * bcc_eq)
-        else:
-            t = K.byte(); has_to, has_cc, bcc_eq = t & 1, (t >> 1) & 1, (t >> 2) & 1
-        G = {}
-        G[b"Date"], mins = self.code_date(F.get(b"Date"), d)
-        G[b"From"] = self.code_addrlist(F.get(b"From"), self.rc_from, d, "from_r", "from_l")
-        if has_to:
-            G[b"To"] = self.code_addrlist(F.get(b"To"), self.rc_to, d, "to_r", "to_l")
-        G[b"Subject"] = self.code_text(F.get(b"Subject"), self.rc_subj, d, "subj_r", "subj_l")
-        if has_cc:
-            G[b"Cc"] = self.code_addrlist(F.get(b"Cc"), self.rc_cc, d, "cc_r", "cc_l")
-            G[b"Bcc"] = G[b"Cc"] if bcc_eq else self.code_addrlist(F.get(b"Bcc"), self.rc_cc, d, "cc_r", "cc_l")
-        for f in (b"Mime-Version", b"Content-Type", b"Content-Transfer-Encoding"):
-            G[f] = self.code_text(F.get(f), self.rc_hdr, f, "hdr_r", "hdr_l")
-        G[b"X-From"] = self.code_text(F.get(b"X-From"), self.rc_xfrom, G[b"From"], "xfrom_r", "xfrom_l")
-        G[b"X-To"] = self.code_xlist(F.get(b"X-To"), G.get(b"To"), self.rc_xto, "xto_r", "xto_l")
-        G[b"X-cc"] = self.code_xlist(F.get(b"X-cc"), G.get(b"Cc"), self.rc_xcc, "xcc_r", "xcc_l")
-        G[b"X-bcc"] = self.code_text(F.get(b"X-bcc"), self.rc_xbcc, None, "xbcc_r", "xbcc_l")
-        body = self.code_body(body)
-        return {"F": G, "has_to": has_to, "has_cc": has_cc, "mins": mins, "body": body}
-
-    def code_body(self, body):
-        R = self.S["bodyref"]
+    # ---------------- body ----------------
+    def code_body(self, ct, cte, body=None):
+        """Body: exact repeat of an earlier body, or MIME segments (text,
+        decoded quoted-printable, decoded base64)."""
+        R, G = self.S["bodyref"], self.S["seg"]
+        eol = self.eol
         if self.enc:
             h = hashlib.md5(body).digest()
             bid = self.bodies.get(h)
             if bid is not None:
-                R.uint(self.nbodies - bid)
-                return body
+                R.uint(self.nbodies - bid); return body
             R.uint(0)
-            if b"\r" not in body: mode, b = 0, body
-            else:
-                t = qp_decode(body) if b"=" in body else None
-                if t is not None and qp_encode(t) == body: mode, b = 3, t
-                elif b"\r" not in body.replace(b"\r\n", b"") and b"\n" not in body.replace(b"\r\n", b""):
-                    mode, b = 1, body.replace(b"\r\n", b"\n")
-                else: mode, b = 2, body
-            self.S["blen"].uint(len(b) * 4 + mode)
-            self.S["body"].blob(b)
-            self.bodies[h] = self.nbodies; self.nbodies += 1
+            ct = ct.replace(eol, b" "); cte = cte.strip().lower()
+            segs = mime_segments(ct, cte, body, eol)
+            if render_segments(segs, eol) != body: segs = [("T", body)]
+            G.uint(len(segs))
+            for kind, p in segs:
+                if kind == "T":
+                    # CRLF text is stored with LF when that is reversible
+                    lf = eol == b"\r\n" and b"\r" not in p.replace(b"\r\n", b"") and b"\n" not in p.replace(b"\r\n", b"")
+                    t = p.replace(b"\r\n", b"\n") if lf else p
+                    G.byte(0 + lf); G.uint(len(t)); self.S["body"].blob(t)
+                elif kind == "Q":
+                    G.byte(2); G.byte(p[0]); G.uint(len(p[1])); self.S["body"].blob(p[1])
+                else:
+                    L, t, dec = p
+                    txt = looks_text(dec)
+                    G.byte(4 + txt); G.uint(L // 4); G.byte(t); G.uint(len(dec))
+                    self.S["body" if txt else "bin"].blob(dec)
+            self.bodies[h] = self.nbodies; self.nbodies += 1; self.bodylist.append(None)
             return body
         r = R.uint()
-        if r:
-            return self.bodylist[self.nbodies - r]
-        x = self.S["blen"].uint(); n, mode = x >> 2, x & 3
-        b = self.S["body"].blob(n)
-        body = b.replace(b"\n", b"\r\n") if mode == 1 else (qp_encode(b) if mode == 3 else b)
+        if r: return self.bodylist[self.nbodies - r]
+        out = []
+        for _ in range(G.uint()):
+            kind = G.byte()
+            if kind <= 1:
+                t = self.S["body"].blob(G.uint())
+                out.append(t.replace(b"\n", b"\r\n") if kind == 1 else t)
+            elif kind == 2:
+                var = G.byte(); dec = self.S["body"].blob(G.uint())
+                out.append(qp_encode(dec, eol, *QP_VARIANTS[var & 7], var >= 8))
+            else:
+                L = G.uint() * 4; t = G.byte(); dec = self.S["body" if kind == 5 else "bin"].blob(G.uint())
+                out.append(b64_render(dec, L, t, eol))
+        body = b"".join(out)
         self.bodylist.append(body); self.nbodies += 1
         return body
 
@@ -509,7 +1002,7 @@ def transform(corpus, tmp):
 def untransform(tmp, corpus):
     nmsg = int(open(os.path.join(tmp, "nmsg")).read())
     S = {n: RStream(open(os.path.join(tmp, n + ".raw"), "rb").read()) for n in STREAMS}
-    C = Codec(False, S); C.bodylist = []
+    C = Codec(False, S)
     with open(corpus, "wb") as out:
         for _ in range(nmsg):
             path, msg = C.code_message()
@@ -519,7 +1012,7 @@ def compress(corpus, archive, jobs=2, keep=None):
     t0 = time.time()
     tmp = keep or tempfile.mkdtemp(prefix="emz")
     os.makedirs(tmp, exist_ok=True)
-    # run the transform in a child process so its memory is released before entropy coding
+    # the transform runs in a child process so its memory is released before entropy coding
     subprocess.run([sys.executable, os.path.abspath(__file__), "T", corpus, tmp], check=True)
     t1 = time.time()
     jobsl = [("c", os.path.join(tmp, n + ".raw"), os.path.join(tmp, n + ".emc")) for n in STREAMS]
@@ -527,7 +1020,7 @@ def compress(corpus, archive, jobs=2, keep=None):
     with ThreadPoolExecutor(jobs) as ex: list(ex.map(run_emcm, jobsl))
     nmsg = int(open(os.path.join(tmp, "nmsg")).read())
     with open(archive, "wb") as out:
-        out.write(b"EMZ2" + struct.pack("<I", nmsg))
+        out.write(MAGIC + struct.pack("<I", nmsg))
         for n in STREAMS:
             data = open(os.path.join(tmp, n + ".emc"), "rb").read()
             out.write(struct.pack("<Q", len(data))); out.write(data)
@@ -541,7 +1034,7 @@ def decompress(archive, corpus, jobs=2):
     tmp = tempfile.mkdtemp(prefix="emzd")
     t0 = time.time()
     with open(archive, "rb") as f:
-        assert f.read(4) == b"EMZ2"
+        if f.read(4) != MAGIC: raise SystemExit("not an emz v2 archive")
         nmsg = struct.unpack("<I", f.read(4))[0]
         jobsl = []
         for n in STREAMS:

@@ -1,0 +1,28 @@
+messages 517401  transform 252.9s  entropy coding 1303.3s
+body       raw  467,299,985  coded  49,774,118
+hdr_l      raw   49,154,416  coded   4,053,137
+seg        raw      980,391  coded     377,111
+date       raw      404,882  coded     330,159
+xal_r      raw    2,284,946  coded     252,468
+mid2       raw      549,318  coded     227,165
+dupref     raw      363,366  coded     180,456
+addr_r     raw      625,103  coded     126,962
+subj_r     raw      770,871  coded     121,768
+dsec       raw      256,957  coded      93,890
+path       raw      622,764  coded      46,868
+mid1       raw      546,055  coded      41,244
+diff       raw      587,083  coded      37,955
+hdr_r      raw    2,161,895  coded      34,047
+tmpl_r     raw      257,019  coded      28,599
+raw        raw      184,012  coded      25,268
+bodyref    raw      270,755  coded      21,819
+kind       raw      517,401  coded      19,958
+dfmt_r     raw      256,687  coded       3,144
+tmpl_l     raw          147  coded         128
+bin        raw            2  coded          22
+sig_r      raw            0  coded          14
+sig_l      raw            0  coded          14
+id_r       raw            0  coded          14
+rdate      raw            0  coded          14
+total coded 55,796,342  archive 55,796,550
+compress exit 0

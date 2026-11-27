@@ -31,7 +31,7 @@ Scripts: `scripts/permsg.py` (baselines), `scripts/permsg_analysis.py`,
 | gzip -6 | 2.22× |
 | zstd -19 | 2.22× |
 | brotli -11 (has a built-in static dictionary) | 2.66× |
-| *emz on the whole archive, for reference* | *25.1×* |
+| *emz on the whole archive, for reference (version 1 / version 2)* | *25.1× / 25.8×* |
 
 The average message is 2.75 KB, too short for an adaptive compressor to learn
 much. The archive coder's tenfold advantage comes almost entirely from
@@ -175,9 +175,10 @@ In order of gain per unit of complexity:
 
 Taken together (1+2+3, measured on S1 above), random-access storage reaches
 **14.3×**, against 2.1–2.2× for today's per-message zstd/gzip. That is 57% of
-the solid-archive ratio (25.1×), while every message stays independently
-readable. Thread-parent references (4) were measured only with zstd and would
-add to this.
+the solid-archive ratio of emz version 1 (25.1×), whose field models these
+experiments use, while every message stays independently readable.
+Thread-parent references (4) were measured only with zstd and would add to
+this.
 
 The remaining gap to the archive has two sources:
 

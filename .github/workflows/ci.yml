@@ -24,6 +24,10 @@ jobs:
         # optimised build (guards against FMA contraction in the mixers)
         run: |
           cc -O1 -ffp-contract=off -fno-fast-math -o emcm_o1 emcm.c -lm
-          python3 emz.py c tests/data/enron_sample.corpus sample.emz
-          EMCM=./emcm_o1 python3 emz.py d sample.emz sample.out
-          cmp tests/data/enron_sample.corpus sample.out
+          for s in enron_sample oss_sample; do
+            python3 emz.py c tests/data/$s.corpus $s.emz
+            EMCM=./emcm_o1 python3 emz.py d $s.emz $s.out
+            cmp tests/data/$s.corpus $s.out
+          done
+      - name: The per-message experiment coder still builds
+        run: make emcm_permsg
