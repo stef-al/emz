@@ -1,0 +1,22 @@
+{"stage": "sets", "S10": 51741, "S10_bytes": 142293832, "S1": 5175, "S1_bytes": 14271681, "train": 51740, "time": "15:09:37"}
+{"stage": "dicts", "method": "zstd-19 + trained dict 110 KB", "bytes": 41009782, "ratio": 3.4697534358997566, "train_s": 152, "time": "15:12:09"}
+{"stage": "dicts", "method": "zstd-19 + trained dict 1024 KB", "bytes": 35766493, "ratio": 3.978411637953992, "train_s": 190, "time": "15:15:19"}
+{"stage": "dicts", "set": "S1", "method": "zstd-19 + trained dict 110 KB", "bytes": 4153114, "ratio": 3.4363807494809917, "time": "15:17:18"}
+{"stage": "dicts", "set": "S1", "method": "zstd-19 + raw-content dict 8 MB", "bytes": 3524415, "ratio": 4.04937585386511, "secs": 16, "time": "15:17:35"}
+{"stage": "dicts", "set": "S1", "method": "zstd-19 + raw-content dict 32 MB", "bytes": 3202048, "ratio": 4.457047801906779, "secs": 13, "time": "15:17:59"}
+{"stage": "split", "header_raw": 45642295, "header_bytes": 9678868, "body_raw": 96651537, "body_bytes": 31150319, "header_share": 0.23705757354414136, "per_msg_header": 187.06379853501093, "per_msg_body": 602.0432345721962, "time": "15:20:24"}
+{"stage": "loo", "header_bytes": 954583, "marginal_bytes": {"X-To": 197322, "To": 135023, "Subject": 95236, "Message-ID": 82692, "Date": 38745, "X-From": 33634, "X-cc": 32292, "X-Folder": 25765, "From": 15131, "X-Origin": 8585, "Cc": 5945, "Bcc": 5375, "X-FileName": 3924, "Mime-Version": -1330, "X-bcc": -4297, "Content-Type": -8703, "Content-Transfer-Encoding": -8843}, "time": "15:20:40"}
+{"stage": "tables", "addresses": 34521, "names": 32263, "folders": 2301, "anchors": 47826, "raw_table_bytes": 3668890, "secs": 4, "time": "15:20:44"}
+{"stage": "transform", "raw_bytes": 142293832, "transformed_bytes": 107021997, "mid_hit_rate": 0.9456675106790111, "time": "15:21:02"}
+{"stage": "transform", "method": "field transform + zstd-19 + dict 110 KB", "bytes": 35315664, "ratio": 4.029198828032796, "time": "15:23:01"}
+{"stage": "transform", "method": "field transform + zstd-19 + dict 1024 KB", "bytes": 31085706, "ratio": 4.5774682421560575, "time": "15:25:40"}
+{"stage": "cmprep", "note": "S1 baseline for the CM runs", "method": "zstd-19 + trained dict 110 KB", "bytes": 4153114, "ratio": 3.4363807494809917, "time": "15:28:56"}
+{"stage": "cmprep", "note": "S1 baseline for the CM runs", "method": "field transform + zstd-19 + dict 110 KB", "bytes": 3593510, "ratio": 3.9715155933891935, "time": "15:31:28"}
+{"stage": "sis", "copies_in_sample": 26023, "sample": 51741, "sis_plus_zstd_dict": 6.413080402737274, "sis_plus_transform_zstd_dict": 7.619566760391936, "bytes_zstd": 22188063, "bytes_transform": 18674793, "time": "15:38:58"}
+{"stage": "parent", "messages": 51741, "copies": 26023, "with_parent_candidate": 35740, "parent_used_noncopies": 8297, "ratio_dict_only": 3.4697534358997566, "ratio_dict_or_parent": 6.231583383907839, "ratio_sis": 6.413080402737274, "ratio_sis_plus_parent": 7.912718982034346, "time": "15:43:36"}
+{"stage": "blocks", "block_messages": 1, "ratio": 3.440108023583298, "bytes": 29859776, "raw": 102720855, "time": "15:47:28"}
+{"stage": "blocks", "block_messages": 4, "ratio": 3.963840253165036, "bytes": 25914479, "raw": 102720855, "time": "15:48:11"}
+{"stage": "blocks", "block_messages": 16, "ratio": 4.394970325212261, "bytes": 23372366, "raw": 102720855, "time": "15:48:53"}
+{"stage": "blocks", "block_messages": 64, "ratio": 4.810457516033789, "bytes": 21353656, "raw": 102720855, "time": "15:49:31"}
+{"stage": "blocks", "block_messages": 256, "ratio": 5.1749644337509055, "bytes": 19849577, "raw": 102720855, "time": "15:50:07"}
+{"stage": "blocks", "block_messages": 1024, "ratio": 5.6523116094773815, "bytes": 18173247, "raw": 102720855, "time": "15:50:41"}

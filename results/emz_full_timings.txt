@@ -1,0 +1,7 @@
+run2 (repository build, -ffp-contract=off; compressed with -march=native build, decompressed with generic -O3 build)
+compress: 1210.13 1274.65 4.31 2744884
+decompress: 2019.77 1476.27 5.57 2744772
+run1 (first build, GCC default FP contraction with -march=native)
+compress: 1301.97 1361.27 6.18 3201236
+decompress: 1189.75 1269.28 6.16 3201216
+format: wall_s user_s sys_s peak_rss_kB

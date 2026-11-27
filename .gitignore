@@ -1,0 +1,11 @@
+# build outputs
+/emcm
+/emcm_o1
+/emcm_permsg
+*.o
+__pycache__/
+# corpus and benchmark working data (fetched / generated, never committed)
+/data/
+*.emz
+*.emc
+*.out

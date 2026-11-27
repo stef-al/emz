@@ -1,0 +1,2 @@
+-rw-r--r-- 1 root root 69624767 Nov 27 14:37 /home/claude/data/abl/enron.emcm_raw
+3379.87 3326.75 3.02 3776180

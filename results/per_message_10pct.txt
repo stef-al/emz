@@ -1,0 +1,6 @@
+gzip-6 (zlib)            64,220,409  ratio   2.22     3.4s
+zstd-3                   66,413,781  ratio   2.14     1.0s
+zstd-19                  63,981,146  ratio   2.22    28.4s
+zstd-19 + 110KB dict     41,850,373  ratio   3.40    35.1s
+brotli-11                53,540,308  ratio   2.66   236.0s
+{"messages": 51741, "raw_bytes": 142293832, "gzip-6 (zlib)": 64220409, "zstd-3": 66413781, "zstd-19": 63981146, "zstd-19 + 110KB dict": 41850373, "brotli-11": 53540308}

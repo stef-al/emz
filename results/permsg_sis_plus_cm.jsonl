@@ -1,0 +1,4 @@
+{"run": "sizes_raw_32MB.txt", "messages": 5175, "copies": 2606, "raw_bytes": 14271681, "ratio_cm": 6.715848146536005, "ratio_sis_plus_cm": 12.496294895335062}
+{"run": "sizes_raw_8MB.txt", "messages": 5175, "copies": 2606, "raw_bytes": 14271681, "ratio_cm": 5.667737731011543, "ratio_sis_plus_cm": 10.852320883656596}
+{"run": "sizes_tr_32MB.txt", "messages": 5175, "copies": 2606, "raw_bytes": 14271681, "ratio_cm": 7.841557115745772, "ratio_sis_plus_cm": 14.321289948381192}
+{"run": "sizes_tr_8MB.txt", "messages": 5175, "copies": 2606, "raw_bytes": 14271681, "ratio_cm": 6.507235083681302, "ratio_sis_plus_cm": 12.173317559072446}

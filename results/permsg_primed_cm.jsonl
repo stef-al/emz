@@ -1,0 +1,4 @@
+{"variant": "raw", "prime_MB": 8, "tbits": 22, "result": {"messages": 5175, "prime_bytes": 8387979, "tbits": 22, "in": 14271681, "out": 2507706, "ratio": 5.691}}
+{"variant": "raw", "prime_MB": 32, "tbits": 24, "result": {"messages": 5175, "prime_bytes": 33552515, "tbits": 24, "in": 14271681, "out": 2114725, "ratio": 6.749}}
+{"variant": "tr", "prime_MB": 32, "tbits": 24, "result": {"messages": 5175, "prime_bytes": 33526982, "tbits": 24, "in": 10788863, "out": 1809656, "ratio": 5.962}}
+{"variant": "tr", "prime_MB": 8, "tbits": 22, "result": {"messages": 5175, "prime_bytes": 8388306, "tbits": 22, "in": 10788863, "out": 2182852, "ratio": 4.943}}
