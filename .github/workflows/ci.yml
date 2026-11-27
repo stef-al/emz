@@ -29,5 +29,10 @@ jobs:
             EMCM=./emcm_o1 python3 emz.py d $s.emz $s.out
             cmp tests/data/$s.corpus $s.out
           done
+          python3 -c "import os, random, sys; sys.path.insert(0, 'tests'); import msgwriter; os.makedirs('msgs')
+          for i in range(6): open('msgs/m%d.msg' % i, 'wb').write(msgwriter.cfb(msgwriter.message(i, random.Random(i), attach=bytes(range(256)) * 20 * (i % 2), embedded=i == 3), ssz=4096 if i % 3 == 0 else 512))"
+          python3 emz.py c msgs msgs.emz
+          EMCM=./emcm_o1 python3 emz.py d msgs.emz msgs.out
+          diff -r msgs msgs.out
       - name: The per-message experiment coder still builds
         run: make emcm_permsg

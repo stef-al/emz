@@ -17,7 +17,9 @@ their folding rule, Enron's derived X- fields via the fields they repeat, and
 recency lists for everything else).  Bodies are split into MIME parts;
 quoted-printable and base64 parts are decoded when re-encoding reproduces the
 original exactly.  Messages whose content already occurred are coded as a
-reference plus a per-field difference mask.  All decisions go to separate
+reference plus a per-field difference mask.  An Outlook .msg file is split
+into its compound-file skeleton and its MAPI property streams (emz_msg.py),
+which are coded by property tag.  All decisions go to separate
 streams, which the context-mixing coder `emcm` compresses.  Anything that does
 not fit is stored verbatim, so the result is always byte-exact.
 """
@@ -25,6 +27,7 @@ import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time, base64,
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qp import qp_decode, qp_encode, QP_VARIANTS
+from emz_msg import CFB_MAGIC, split as msg_split, skeleton_decode, fill as msg_fill, rtf_split, rtf_join
 
 EMCM = os.environ.get("EMCM", os.path.join(os.path.dirname(os.path.abspath(__file__)), "emcm"))
 MAGIC = b"EMZ4"
@@ -75,7 +78,8 @@ class RStream:
 STREAMS = ["path", "kind", "dupref", "diff", "tmpl_r", "tmpl_l",
            "hdr_r", "hdr_l", "sig_r", "sig_l", "addr_r", "xal_r", "subj_r",
            "id_r", "mid1", "mid2", "date", "dsec", "dfmt_r", "rdate",
-           "seg", "bodyref", "body", "bin", "raw", "env_r", "env_l", "env_d"]
+           "seg", "bodyref", "body", "bin", "raw", "env_r", "env_l", "env_d",
+           "msg_r", "msg_skel", "msg_str", "msg_bin", "msg_prop", "msg_rtf"]
 
 # --------------------------------------------------------------------------
 class Recency:
@@ -429,6 +433,50 @@ def render_segments(segs, eol):
     return b"".join(out)
 
 # --------------------------------------------------------------------------
+# Outlook .msg streams (the compound file itself: emz_msg.py)
+MSG_BIG = 4096        # values from this size on are deduplicated and coded into body / bin
+MSG_KEY_IDS = {0x0037, 0x0E1D, 0x0070, 0x0C1A, 0x0C1F, 0x0042, 0x0065, 0x5D01, 0x5D02, 0x0E04, 0x0E03,
+               0x1035, 0x0040, 0x0044, 0x0076, 0x0078, 0x3FFA, 0x1042, 0x1039, 0x3001, 0x3003, 0x39FE}
+MSG_VARLEN = {0x001E, 0x001F, 0x0102, 0x000D, 0x0048}
+MSG_KEYNORM = re.compile(r"#[0-9A-Fa-f]{8}")
+
+def msg_tag(name):
+    """Property tag of a `__substg1.0_TTTTYYYY` stream name, else None."""
+    if name.startswith("__substg1.0_") and len(name) == 20:
+        try: return int(name[12:], 16)
+        except ValueError: pass
+    return None
+
+def msg_priority(path):
+    """Coding order of the streams of a .msg: transport headers first (their
+    fields become known strings), the strings other values repeat, other
+    strings, binary values, property streams, named-property maps, then
+    bodies (plain text before HTML before RTF) and attachments."""
+    name = path.rpartition("/")[2]
+    if name == "__properties_version1.0": return 5
+    if path.startswith("__nameid_version1.0/"): return 6
+    tag = msg_tag(name)
+    if tag is None: return 7
+    pid, typ = tag >> 16, tag & 0xFFFF
+    if pid == 0x007D: return 0
+    order = {0x1000: 8, 0x1013: 9, 0x1009: 10, 0x3701: 11}
+    if pid in order: return order[pid]
+    if typ in (0x1E, 0x1F): return 1 if pid in MSG_KEY_IDS else 2
+    return 3 if typ == 0x0102 else 4
+
+def msg_text(v):
+    """UTF-16LE string value -> UTF-8 (lone surrogates kept), or None."""
+    if len(v) % 2: return None
+    try:
+        t = v.decode("utf-16-le", "surrogatepass").encode("utf-8", "surrogatepass")
+        return t if msg_untext(t) == v else None
+    except UnicodeError:
+        return None
+
+def msg_untext(t):
+    return t.decode("utf-8", "surrogatepass").encode("utf-16-le", "surrogatepass")
+
+# --------------------------------------------------------------------------
 class Codec:
     PM_M, PM_A, PM_MASK, PM_K = 2**31 - 1, 16807, (1 << 25) - 1, 64
 
@@ -444,6 +492,8 @@ class Codec:
         self.rc = Recency(8); self.rc_big = Recency(64); self.rc_small = Recency(4)
         self.rc_name = Recency(4); self.rc_dfmt = Recency(16)
         self.env_style = 0
+        self.msg_rc = {}; self.big = {}; self.nbig = 0; self.bigs = []
+        self.prop_delta = {}; self.last_ft = 0; self.gval = {}; self.gvals = []
 
     # ---------------- path ----------------
     def code_path(self, path=None):
@@ -499,6 +549,17 @@ class Codec:
         """Encoder: code one message (env: its mbox `From ` line or None).
         Decoder: return (path, message, env)."""
         path = self.code_path(path)
+        if self.enc and msg[:8] == CFB_MAGIC:
+            parts = msg_split(msg)
+            if parts is not None:
+                self.S["kind"].byte(3 | 8 * (env is not None))
+                self.code_msg(path, msg, parts)
+                if env is not None: self.code_envelope(env, None, None)
+                return path, msg
+        return self.code_rfc(path, msg, env)
+
+    def code_rfc(self, path, msg=None, env=None):
+        """An RFC 5322 message (or anything else, kept raw)."""
         K = self.S["kind"]
         folder = path.rpartition("/")[0]; user = path.split("/")[0]
         if self.enc:
@@ -517,6 +578,9 @@ class Codec:
         else:
             t = K.byte()
             has_env = t >= 8; t &= 7
+            if t == 3:
+                m = self.code_msg(path)
+                return path, m, (self.code_envelope(None, None, None) if has_env else None)
             if t == 2:
                 n = self.S["raw"].uint(); m = self.S["raw"].blob(n)
                 return path, m, (self.code_envelope(None, None, None) if has_env else None)
@@ -1071,6 +1135,238 @@ class Codec:
         self.bodylist.append(body); self.nbodies += 1
         return body
 
+    # ---------------- Outlook .msg ----------------
+    def code_msg(self, path, msg=None, parts=None):
+        """Compound-file message (emz_msg.py): the skeleton, then every
+        stream with the model for its property tag, in msg_priority order."""
+        if self.enc:
+            sk, cfb, contents = parts
+            self.S["msg_skel"].blob(sk)
+        else:
+            Sk = self.S["msg_skel"]
+            zeroed, cfb, Sk.p = skeleton_decode(Sk.b, Sk.p)
+            contents = [None] * len(cfb.streams)
+        sizes = {st[1]: st[2] for st in cfb.streams}
+        self.mvals = []; self.mpos = {}; self.mknown = []; self.mrx = None
+        for k in sorted(range(len(cfb.streams)), key=lambda k: (msg_priority(cfb.streams[k][1]), k)):
+            _, spath, size, _ = cfb.streams[k]
+            contents[k] = self.code_msg_stream(path, spath, size, sizes, contents[k])
+        return msg if self.enc else msg_fill(zeroed, cfb, contents)
+
+    def code_msg_stream(self, path, spath, size, sizes, v):
+        if not size: return b""
+        name = spath.rpartition("/")[2]
+        tag = msg_tag(name)
+        pid, typ = (tag >> 16, tag & 0xFFFF) if tag is not None else (None, None)
+        if name == "__properties_version1.0":
+            return self.code_props(spath, size, sizes, v)
+        if pid == 0x007D and typ in (0x1E, 0x1F):
+            return self.code_transport(path, typ, size, v)
+        if size >= MSG_BIG or pid in (0x1000, 0x1009, 0x1013, 0x3701):
+            return self.code_msg_big(path, pid, typ, size, v)
+        v = self.code_msg_small(spath, typ, size, v)
+        if typ in (0x1E, 0x1F):
+            t = msg_text(v) if typ == 0x1F else v
+            if t is not None: self.add_known(t.rstrip(b"\0"))
+        return v
+
+    def add_known(self, t):
+        """Strings that later values of this .msg may contain (msg_sub)."""
+        for x in (t, t.upper() if b"@" in t or b"/O=" in t.upper() else t):
+            if 4 <= len(x) <= 1024 and b"\x06" not in x and x not in self.mknown and len(self.mknown) < 240:
+                self.mknown.append(x); self.mrx = None
+
+    def msg_sub(self, t):
+        """Copies of known strings -> \x06 + index byte (literal \x06 -> \x06\x06)."""
+        if self.mrx is None:
+            self.mcode = {x: bytes([6, 0x10 + i]) for i, x in enumerate(self.mknown)}
+            pat = b"|".join(re.escape(x) for x in sorted(self.mknown, key=len, reverse=True))
+            self.mrx = re.compile(pat + b"|\x06" if pat else b"\x06")
+        code = self.mcode
+        return self.mrx.sub(lambda m: code.get(m.group(0), b"\x06\x06"), t)
+
+    def msg_unsub(self, t):
+        known = self.mknown
+        return GEN_MARK.sub(lambda m: b"\x06" if m.group(1) == b"\x06" else known[m.group(1)[0] - 0x10], t)
+
+    def code_msg_small(self, spath, typ, size, v):
+        """Value below MSG_BIG: copy of an earlier value of this .msg,
+        recency rank among the last values of the same property, copy of an
+        earlier value of at least 64 bytes anywhere in the archive, or literal
+        (strings as UTF-8 with known strings replaced)."""
+        R = self.S["msg_r"]
+        lst = self.msg_rc.setdefault(MSG_KEYNORM.sub("#", spath), [])
+        if self.enc:
+            j = self.mpos.get(v)
+            if j is not None:
+                R.byte(1); R.uint(len(self.mvals) - 1 - j)
+            elif v in lst:
+                R.byte(2 + lst.index(v))
+            elif len(v) >= 64 and hashlib.md5(v).digest() in self.gval:
+                R.byte(12); R.uint(len(self.gval) - 1 - self.gval[hashlib.md5(v).digest()])
+            else:
+                t = msg_text(v) if typ == 0x1F else None
+                if t is not None:
+                    R.byte(10); self.S["msg_str"].text_end(self.msg_sub(t))
+                else:
+                    t = self.msg_sub(v)
+                    if typ == 0x1E or t != v.replace(b"\x06", b"\x06\x06"):
+                        R.byte(11); self.S["msg_str"].text_end(t)
+                    else:
+                        R.byte(0); self.S["msg_bin"].blob(v)
+        else:
+            m = R.byte()
+            if m == 1: v = self.mvals[len(self.mvals) - 1 - R.uint()]
+            elif m < 10 and m >= 2: v = lst[m - 2]
+            elif m == 10: v = msg_untext(self.msg_unsub(self.S["msg_str"].until_end()))
+            elif m == 11: v = self.msg_unsub(self.S["msg_str"].until_end())
+            elif m == 12: v = self.gvals[len(self.gvals) - 1 - R.uint()]
+            else: v = self.S["msg_bin"].blob(size)
+        if len(v) >= 64:
+            h = hashlib.md5(v).digest()
+            if h not in self.gval:
+                self.gval[h] = len(self.gval)
+                if not self.enc: self.gvals.append(v)
+        if v not in self.mpos:
+            self.mpos[v] = len(self.mvals); self.mvals.append(v)
+        if v in lst: lst.remove(v)
+        lst.insert(0, v); del lst[8:]
+        return v
+
+    def code_msg_big(self, path, pid, typ, size, v):
+        """Bodies, attachments and other large values: copy of an earlier
+        one, compressed RTF as its text plus token choices, an attached .msg
+        or MIME entity by its own models, text into the body stream (UTF-16
+        as UTF-8, CRLF as LF when reversible), else bytes into bin."""
+        R = self.S["msg_r"]
+        if self.enc:
+            h = hashlib.md5(v).digest(); j = self.big.get(h)
+            if j is not None:
+                R.byte(1); R.uint(self.nbig - 1 - j); return v
+            self.big[h] = self.nbig; self.nbig += 1
+            r = None
+            if pid == 0x1009 and typ == 0x0102:
+                try: r = rtf_split(v)
+                except (IndexError, ValueError, struct.error): r = None
+            if r is not None:
+                R.byte(6); self.S["body"].text_end(r[0]); R.uint(len(r[1])); self.S["msg_rtf"].blob(r[1])
+                return v
+            if pid == 0x3701 and typ == 0x0102:
+                parts = msg_split(v) if v[:8] == CFB_MAGIC else None
+                if parts is not None:                       # a .msg attached as a file
+                    R.byte(8); self.code_msg(path, v, parts); return v
+                if parse_message(v) is not None:            # a MIME entity (S/MIME smime.p7m, .eml)
+                    R.byte(7); self.code_rfc(path, v, None); return v
+            t = msg_text(v) if typ == 0x1F else None
+            if t is not None: mode = 2
+            elif typ == 0x1E or looks_text(v): mode, t = 4, v
+            else:
+                R.byte(0); self.S["bin"].blob(v); return v
+            z = t.replace(b"\r\n", b"")
+            lf = b"\r\n" in t and b"\r" not in z and b"\n" not in z
+            R.byte(mode + lf); self.S["body"].text_end(t.replace(b"\r\n", b"\n") if lf else t)
+            return v
+        m = R.byte()
+        if m == 1: return self.bigs[len(self.bigs) - 1 - R.uint()]
+        if m == 0: v = self.S["bin"].blob(size)
+        elif m == 6:
+            t = self.S["body"].until_end(); v = rtf_join(t, self.S["msg_rtf"].blob(R.uint()))
+        elif m == 7: v = self.code_rfc(path)[1]
+        elif m == 8: v = self.code_msg(path)
+        else:
+            t = self.S["body"].until_end()
+            if m & 1: t = t.replace(b"\n", b"\r\n")
+            v = msg_untext(t) if m < 4 else t
+        self.bigs.append(v)
+        return v
+
+    def code_transport(self, path, typ, size, v):
+        """PR_TRANSPORT_MESSAGE_HEADERS: coded as an RFC 5322 header block
+        by the header field models; its fields become known strings."""
+        R = self.S["msg_r"]
+        if self.enc:
+            t = msg_text(v) if typ == 0x1F else v
+            M = None
+            if t is not None:
+                i = t.find(b"\n")
+                eol = b"\r\n" if i > 0 and t[i - 1:i] == b"\r" else b"\n"
+                suf = b"" if t.endswith(eol + eol) else eol if t.endswith(eol) else eol + eol
+                M = t + suf
+                if parse_message(M) is None or M[:8] == CFB_MAGIC: M = None
+            if M is None:
+                R.byte(0); return self.code_msg_big(path, 0x007D, typ, size, v)
+            R.byte(1 + len(suf)); self.code_rfc(path, M, None)
+        else:
+            m = R.byte()
+            if m == 0: return self.code_msg_big(path, 0x007D, typ, size, None)
+            M = self.code_rfc(path)[1]
+            t = M[:len(M) - (m - 1)]
+            v = msg_untext(t) if typ == 0x1F else t
+        vals = self.cur["vals"]; eol = self.eol
+        for ln in (b"subject", b"thread-topic", b"message-id", b"in-reply-to"):
+            x = (vals.get(ln) or b"").replace(eol, b"").strip()
+            if x:
+                self.add_known(x)
+                if ln == b"subject": self.add_known(SUBJ_PFX.sub(b"", x, 1))
+        for ln in (b"from", b"sender", b"reply-to", b"to", b"cc"):
+            x = (vals.get(ln) or b"").replace(eol, b"")
+            for a in ANGLE_ADDR.findall(x): self.add_known(a)
+            for part in x.split(b","):
+                nm = part.split(b"<")[0].strip().strip(b'"').strip()
+                if nm: self.add_known(nm)
+        return v
+
+    def code_props(self, spath, size, sizes, v):
+        """__properties_version1.0: header, then 16-byte entries (tag, flags,
+        value), coded as columns.  The size field of a variable-length
+        property is coded against the size of its stream, times against the
+        previous time."""
+        R, P = self.S["msg_r"], self.S["msg_prop"]
+        storage = spath.rpartition("/")[0]
+        pre = storage + "/" if storage else ""
+        hb = 32 if not storage else 24 if storage.endswith("__substg1.0_3701000D") else 8
+        if size < hb or (size - hb) % 16:
+            if self.enc: R.byte(0); self.S["msg_bin"].blob(v); return v
+            R.byte(); return self.S["msg_bin"].blob(size)
+        n = (size - hb) // 16
+        if self.enc:
+            R.byte(1); P.blob(v[:hb])
+            P.blob(b"".join(v[o:o + 4] for o in range(hb, size, 16)))
+            P.blob(b"".join(v[o + 4:o + 8] for o in range(hb, size, 16)))
+            head = v[:hb]; tags = [struct.unpack_from("<I", v, o)[0] for o in range(hb, size, 16)]
+        else:
+            R.byte(); head = P.blob(hb)
+            tb = P.blob(4 * n); fb = P.blob(4 * n)
+            tags = list(struct.unpack("<%dI" % n, tb))
+        vals = []
+        for k, tag in enumerate(tags):
+            typ = tag & 0xFFFF
+            o = hb + 16 * k + 8
+            if typ in MSG_VARLEN or typ & 0x1000:
+                sz = sizes.get(pre + "__substg1.0_%08X" % tag)
+                pred = (sz + self.prop_delta.get(typ, 0)) & 0xFFFFFFFF if sz is not None else 0xFFFFFFFF
+                if self.enc:
+                    lo, hi = struct.unpack_from("<II", v, o)
+                    P.blob(struct.pack("<II", (lo - pred) & 0xFFFFFFFF, hi))
+                else:
+                    d, hi = struct.unpack("<II", P.blob(8))
+                    lo = (d + pred) & 0xFFFFFFFF
+                if sz is not None: self.prop_delta[typ] = (lo - sz) & 0xFFFFFFFF
+                vals.append(struct.pack("<II", lo, hi))
+            elif typ == 0x0040:
+                if self.enc:
+                    ft = struct.unpack_from("<Q", v, o)[0]
+                    P.blob(struct.pack("<Q", (ft - self.last_ft) & 0xFFFFFFFFFFFFFFFF))
+                else:
+                    ft = (struct.unpack("<Q", P.blob(8))[0] + self.last_ft) & 0xFFFFFFFFFFFFFFFF
+                self.last_ft = ft; vals.append(struct.pack("<Q", ft))
+            else:
+                x = v[o:o + 8] if self.enc else P.blob(8)
+                if self.enc: P.blob(x)
+                vals.append(x)
+        if self.enc: return v
+        return head + b"".join(tb[4 * k:4 * k + 4] + fb[4 * k:4 * k + 4] + vals[k] for k in range(n))
+
 # --------------------------------------------------------------------------
 def iter_corpus(fn):
     with open(fn, "rb") as f:
@@ -1235,7 +1531,7 @@ def compress(src, archive, jobs=2, keep=None):
     tmp = keep or tempfile.mkdtemp(prefix="emz")
     os.makedirs(tmp, exist_ok=True)
     # the transform runs in a child process so its memory is released before entropy coding
-    subprocess.run([sys.executable, os.path.abspath(__file__), "T", src, tmp], check=True)
+    subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "T", src, tmp], check=True)
     t1 = time.time()
     parts = {}
     jobsl = []
@@ -1290,7 +1586,7 @@ def decompress(archive, dst, jobs=2):
                 for i in range(parts[n]):
                     with open(os.path.join(tmp, "%s.raw.%d" % (n, i)), "rb") as h: shutil.copyfileobj(h, g)
         t1 = time.time()
-        subprocess.run([sys.executable, os.path.abspath(__file__), "U", tmp, dst], check=True)
+        subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "U", tmp, dst], check=True)
         print(f"entropy decoding {t1 - t0:.1f}s  inverse transform {time.time() - t1:.1f}s  (SHA-256 verified)",
               file=sys.stderr)
     finally:

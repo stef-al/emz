@@ -202,3 +202,50 @@ Together, **estimated −0.5 to −1%.**
   concurrently (already done).
 * Parallel body coding: split the body stream into 2–4 independent segments
   by mailbox. **Estimated cost 1–2% ratio**, for a near-linear speed-up.
+
+## 8. Outlook files
+
+**Implemented: `.msg`** (see the README section and
+`results/msg_samples.txt`). On 25 sample files with attachment bytes zeroed
+the archive is 97.1 KB, against 186.2 KB for emz without `.msg` support and
+181.1 KB for xz -9e (**measured**). Where the 96.8 KB of coded streams go:
+
+| Part | Coded (bytes) | Share |
+|---|---:|---:|
+| Body text: plain, HTML and decompressed RTF | 23,874 | 24.7% |
+| Small binary values (entry IDs, Exchange metadata, named-property maps) | 20,763 | 21.4% |
+| String literals | 15,895 | 16.4% |
+| Transport headers (signature material 8,220, other literals 5,723) | 15,546 | 16.1% |
+| Compound-file skeleton | 11,123 | 11.5% |
+| Property streams | 6,419 | 6.6% |
+| Value modes, RTF token choices, zeroed attachments, paths | 3,194 | 3.3% |
+
+Next steps, largest first:
+
+* **RTF against the other bodies** (**estimated**: most of the RTF's share
+  of the body stream, about 15 KB of 24 KB here). Outlook's RTF either wraps
+  the plain-text body (`\fromtext`) or the HTML body (`\fromhtml1`, the HTML
+  kept in `\*\htmltag` groups). Decoding the encapsulation and coding the RTF
+  as the operations that turn the other body into it would leave the RTF
+  boilerplate, which repeats from message to message.
+* **PST and OST stores.** The node database (pages, blocks, B-trees) is a
+  container like the compound file: blocks are "permute"-encoded (a fixed
+  byte substitution) or "cyclic"-encoded (keyed by block ID), both reversible;
+  the property contexts inside hold the same properties as a `.msg`, so the
+  value models carry over. OST files of Outlook 2013 and later store blocks
+  zlib-compressed in 4 KB pages; Python's zlib does not reproduce
+  Outlook's deflate output (tried on a sample OST), so those blocks need
+  either a deflate re-encoder that can be told the encoder's choices
+  (precomp-style) or verbatim storage. A PST of the Enron sample is in
+  pst-extractor's test data.
+* **Directory trees** (**measured**: standard red-black insertion in entry
+  order reproduces 81 of 119 sibling trees exactly, another 25 up to the
+  colours). Coding each entry's parent and then predicting the tree would
+  save most of the 2.6 KB of tree links and 0.3 KB of colours.
+* **Directory sizes** (2.0 KB) could be coded with the stream name as
+  context (fixed-size properties such as GUIDs and times).
+* **ZIP inside values**: Exchange stores a theme as a small Office package
+  (deflate) in a named property, and attachments are often Office files.
+  Re-encoding deflate exactly would make them compressible.
+* **The last 0.6% of RTF tokens**: all differ only after the 4 KB dictionary
+  wraps, so some detail of node deletion is still unknown.

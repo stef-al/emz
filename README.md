@@ -1,8 +1,9 @@
 # emz — structure-aware compression of e-mail archives
 
 `emz` is a lossless compressor for mail archives (maildir and other
-directory trees, mbox files, mailing-list archives) that models what an e-mail
-*is* instead of treating the archive as a flat byte stream. Every model checks
+directory trees, mbox files, mailing-list archives, Outlook `.msg` files) that
+models what an e-mail *is* instead of treating the archive as a flat byte
+stream. Every model checks
 that it reproduces the original bytes exactly. Anything that does not fit is
 coded as is, so the output is always a byte-exact copy, and decompression
 checks a SHA-256 of the original.
@@ -83,6 +84,65 @@ The Enron-specific models of version 1 (Park–Miller Message-IDs, JavaMail
 address folding, X-From/X-To name alignment, X-Folder/X-Origin/X-FileName)
 are unchanged.
 
+## Outlook .msg files
+
+An Outlook `.msg` file is a compound file (a small FAT file system, MS-CFB)
+whose streams hold the message's MAPI properties (MS-OXMSG). Plain
+compressors see sector padding, directory records, UTF-16 text, the same
+names and addresses stored five times, and an RTF body that Outlook has
+already compressed. emz takes such a file apart and codes each part with a
+model of its own:
+
+* **Skeleton.** The header, FAT, mini FAT and directory are coded field by
+  field: chain links as "next sector", directory entries as columns (names
+  as text, tree links, start sectors against allocation order, sizes), and
+  the bytes that are neither structure nor stream content (sector slack, free
+  sectors) as zero runs.
+* **Property values** are coded in an order that puts what others repeat
+  first. The transport headers (`PR_TRANSPORT_MESSAGE_HEADERS`) go through
+  the RFC 5322 field models above, and their subject, addresses, names and
+  Message-ID become known strings. A value is then a copy of an earlier value
+  of the same file, a recency rank among the last values of the same
+  property, a copy of an earlier value anywhere in the archive, or a literal
+  in which known strings are replaced by markers. UTF-16 strings are stored
+  as UTF-8.
+* **Property streams** (`__properties_version1.0`) are coded as columns
+  (tags, flags, values); the size field of a string or binary property is
+  predicted from the size of its stream, times from the previous time.
+* **Compressed RTF** is stored decompressed, in the body text stream next
+  to the plain-text body. The exact compressed bytes are rebuilt from the text
+  and one choice per token. The choice is "as predicted" whenever the token
+  is what Outlook's own match finder would code. That finder turned out to be
+  an LZSS binary search tree in the style of Okumura's LZSS.C (a tree per
+  first byte, the first of several equally long matches on the search path
+  wins, deletion by successor); simulating it predicts 99.4% of the tokens
+  of Outlook's streams. Streams from any other writer are still rebuilt
+  exactly, with explicit choices.
+* **Bodies and attachments** are de-duplicated across the archive; text goes
+  to the body stream (CRLF as LF when reversible), an attached MIME entity
+  (for example the `smime.p7m` of a signed message) through the MIME models,
+  an attached `.msg` recursively, anything else to the binary stream.
+
+Every step is verified when compressing; a file that does not parse as a
+compound file, or whose layout is unusual (overlapping or out-of-range
+sectors, broken chains), is stored verbatim.
+
+On 25 sample files from the test suites of two open-source `.msg` readers
+(8.5 MB, details in [`results/msg_samples.txt`](results/msg_samples.txt)):
+
+| Archive of the 25 files | As they are | Attachment bytes zeroed |
+|---|---:|---:|
+| **emz** | **2,595,994** | **97,117** |
+| emz before `.msg` support (file coded by `emcm` alone) | 2,691,840 | 186,153 |
+| xz -9e (tar) | 2,726,152 | 181,148 |
+| zstd -19 --long=27 (tar) | 2,742,258 | 196,251 |
+
+Attachments (TIFF, PDF, Office files, JPEG, mostly compressed already) are
+83% of the input bytes and 96% of emz's output in the left column. With the
+attachment bytes set to zero, the messages code to 46% less than xz -9e and
+48% less than emz did before. The 23 compressed RTF bodies (120,003 bytes) cost 581 bytes of token
+choices plus their text in the body stream.
+
 ## Quick start
 
 ```sh
@@ -99,7 +159,9 @@ The input form is detected automatically: a directory (every regular file is
 one message; names, sub-directories and empty directories are kept, file times
 and permissions are not), an mbox file (starts with `From `), a *corpus* file
 (for each message `path\n`, `length\n`, then the raw bytes; the benchmark
-corpora use it), or any other file as a single message.
+corpora use it), or any other file as a single message. A message that is an
+Outlook `.msg` file is recognised by its content, in any of these forms
+(`python3 emz.py c saved_mails/ mails.emz`).
 
 The full corpora are not stored in this repository. To fetch and serialise
 them:
@@ -472,6 +534,12 @@ independently readable.
   anti-spam reports and already-compressed attachments are close to random.
   On the recent corpus they set a floor of roughly 8–9 MB, over 40% of emz's
   output.
+* **Outlook files.** `.msg` files are supported; PST and OST stores are not
+  yet (see [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md)). The RTF match
+  finder runs in Python: about 0.14 MB/s of RTF text when compressing
+  (prediction plus verification) and 0.29 MB/s when decompressing.
+  The `.msg` samples are small (25 files), so the numbers above show the
+  method rather than what a large Outlook archive would give.
 
 ## Related approaches
 
@@ -576,7 +644,18 @@ sees each kind of literal on its own.
   Enron, date for the list archive). Re-ordering Enron by date or by thread
   was tested; neither helped, and date order was 1.1% worse.
 
-### 5. Entropy coding: `emcm`
+### 5. Outlook .msg files
+
+See [Outlook .msg files](#outlook-msg-files) for the parts. Stream order
+inside a `.msg`: transport headers, the strings other values repeat
+(subject, sender, recipients, Message-ID), other strings, binary values,
+property streams, named-property maps, plain-text body, HTML body, RTF body,
+attachments. The skeleton is decoded first, so the decoder knows every
+stream's name and size before any content. `emz_msg.py` holds the compound
+file reader and skeleton coder and the compressed-RTF codec; `rtf_compress`
+there compresses RTF the way Outlook does.
+
+### 6. Entropy coding: `emcm`
 
 `emcm.c` is a bitwise context-mixing coder in the paq/lpaq family, written for
 this project:
@@ -624,7 +703,8 @@ this project:
 | `emz.py` | parser, field and MIME models, streams, container, decoder |
 | `emcm.c` | context-mixing back end (build with `make`) |
 | `qp.py` | quoted-printable decoder and the 8 encoder variants |
-| `tests/` | unit and round-trip tests, and two sample corpora chosen to exercise every code path: `enron_sample.corpus` (564 Enron messages, 1.1 MB) and `oss_sample.corpus` (184 oss-security messages, 1.2 MB) |
+| `emz_msg.py` | Outlook `.msg`: compound-file reader, skeleton coder, compressed-RTF codec with Outlook's match finder |
+| `tests/` | unit and round-trip tests, and two sample corpora chosen to exercise every code path: `enron_sample.corpus` (564 Enron messages, 1.1 MB) and `oss_sample.corpus` (184 oss-security messages, 1.2 MB); `msgwriter.py` writes synthetic `.msg` files for the `.msg` tests |
 | `scripts/fetch_enron.sh`, `scripts/build_corpus.py` | download the Enron corpus and build the canonical file |
 | `scripts/fetch_oss_security.sh`, `scripts/build_inbox_corpus.py` | the same for the oss-security mirror |
 | `scripts/make_sample.py`, `scripts/make_sample_modern.py` | how the test samples were selected |
@@ -652,3 +732,6 @@ context-mixing compressors by Matt Mahoney and contributors: bit-history
 states, StateMaps, logistic mixing and APM/SSE stages. The Enron corpus is
 the CMU release of 2015-05-07 by William W. Cohen and the CALO project. The
 oss-security list is run by Openwall; its messages belong to their authors.
+The `.msg` measurements used the sample files of the MSGReader (MIT) and
+msg-extractor (GPL-3.0) projects, which are not included here. The RTF match
+finder follows Haruhiko Okumura's LZSS.C (1989).
