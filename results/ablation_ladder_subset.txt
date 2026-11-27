@@ -1,0 +1,5 @@
+split 5838565
+dedup 5597695
+raw 5976320
+emz 5310297
+emz s100 roundtrip OK

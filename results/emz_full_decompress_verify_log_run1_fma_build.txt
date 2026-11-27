@@ -1,0 +1,5 @@
+entropy decoding 1152.8s  inverse transform 36.9s
+EXIT 0
+5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc  /home/claude/data/full/enron.dec
+5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc  /home/claude/data/enron.corpus
+ROUNDTRIP_OK

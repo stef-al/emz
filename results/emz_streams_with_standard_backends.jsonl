@@ -1,0 +1,4 @@
+{"backend": "bsc-e2", "total": 65810117, "body": 58241246}
+{"backend": "ppmd-o16", "total": 72507019, "body": 64849020}
+{"backend": "zstd-19-long", "total": 79567395, "body": 71168834}
+{"backend": "xz-9e", "total": 78233120, "body": 70208556}

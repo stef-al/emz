@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the coder
+        run: make
+      - name: Unit and round-trip tests
+        run: make test
+      - name: Archives are portable between builds
+        # an archive written by one build must decode with a differently
+        # optimised build (guards against FMA contraction in the mixers)
+        run: |
+          cc -O1 -ffp-contract=off -fno-fast-math -o emcm_o1 emcm.c -lm
+          python3 emz.py c tests/data/enron_sample.corpus sample.emz
+          EMCM=./emcm_o1 python3 emz.py d sample.emz sample.out
+          cmp tests/data/enron_sample.corpus sample.out

@@ -1,0 +1,2 @@
+# raw e-mail bytes (mixed CRLF/LF line endings must survive checkout unchanged)
+*.corpus binary
