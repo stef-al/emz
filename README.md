@@ -1,24 +1,25 @@
 # emz — structure-aware compression of e-mail archives
 
-`emz` is a lossless compressor for mail archives (maildir trees, mbox
-collections, mailing-list archives) that models what an e-mail *is* instead of
-treating the archive as a flat byte stream. Every model checks that it
-reproduces the original bytes exactly. Anything that does not fit is coded
-as is, so the output is always a byte-exact copy.
+`emz` is a lossless compressor for mail archives (maildir and other
+directory trees, mbox files, mailing-list archives) that models what an e-mail
+*is* instead of treating the archive as a flat byte stream. Every model checks
+that it reproduces the original bytes exactly. Anything that does not fit is
+coded as is, so the output is always a byte-exact copy, and decompression
+checks a SHA-256 of the original.
 
 It is evaluated on two corpora from different eras of e-mail:
 
 | Corpus | Messages | Size | **emz** | Best existing tool | xz -9e |
 |---|---:|---:|---:|---:|---:|
-| Enron (CMU release; corporate mail of the early 2000s) | 517,401 | 1,437.5 MB | **55.80 MB (25.8×)** | 80.28 MB (lrzip -z) | 112.38 MB |
-| oss-security mailing list, 2015–2026 | 16,967 | 132.1 MB | **20.24 MB (6.53×)** | 23.74 MB (zpaq -m5) | 26.64 MB |
+| Enron (CMU release; corporate mail of the early 2000s) | 517,401 | 1,437.5 MB | **54.47 MB (26.4×)** | 80.28 MB (lrzip -z) | 112.38 MB |
+| oss-security mailing list, 2015–2026 | 16,967 | 132.1 MB | **19.92 MB (6.63×)** | 23.74 MB (zpaq -m5) | 26.64 MB |
 
-* emz is 30% smaller than the best existing tool on Enron, and 14.8%
-  smaller than zpaq -m5 (24% smaller than xz) on the recent list archive.
+* emz is 32% smaller than the best existing tool on Enron, and 16%
+  smaller than zpaq -m5 (25% smaller than xz) on the recent list archive.
 * Recent mail compresses far less well. Each message carries DKIM/ARC
   signatures and other cryptographic header values that are random by design:
-  they make up 27% of emz's output on the recent corpus. Binary attachments
-  are another 16%.
+  they make up 28% of emz's output on the recent corpus. Binary attachments
+  are another 17%.
 * If each message must stay readable on its own, today's per-message
   zstd/gzip gets 2.1–2.2× on Enron. The per-message variant of the same ideas
   measured **14.3×** on a 1% sample: static field tables, a frozen
@@ -60,9 +61,23 @@ the verbatim path. Version 2 handles any RFC 5322 message:
   delimiter line repeats it.
 * **Copies** of a message are coded as a reference plus the fields that
   differ.
-* **Coder.** A match model that follows quoted text through `> ` prefixes
-  (−1.8% on recent message bodies), 4-way bucket search, sparse insertion for
-  the long match model and an order-2 APM stage.
+* **Body ends.** Each body text part ends with a mark inside the text stream
+  instead of a stored length, so the coder predicts where a message ends from
+  its last lines (signatures, disclaimers): −0.6% on Enron.
+* **Coder.** A run model per context (the last byte seen in that context and
+  how often it repeated), direct order-1 and order-2 inputs, finer mixer
+  weight sets, a learned final mix of the APM stages, a match model that
+  follows quoted text through `> ` prefixes, 4-way bucket search, sparse
+  insertion for the long match model and an order-2 APM stage. Together
+  −2.1% (Enron) and −3.7% (recent mail) on message bodies against version 1.
+* **Input forms.** emz reads a directory tree (maildir, MH: every regular file
+  is a message), an mbox file, a corpus file or a single message, and
+  decompression restores the same form. An mbox `From ` line is coded against
+  the message's own Return-Path and topmost Received time, which leaves about
+  2 bytes per message.
+* **Safety.** The archive stores a SHA-256 of the input, and decompression
+  fails loudly if the output differs. Streams larger than 2 GiB are split so
+  the coder's 32-bit positions never overflow.
 
 The Enron-specific models of version 1 (Park–Miller Message-IDs, JavaMail
 address folding, X-From/X-To name alignment, X-Folder/X-Origin/X-FileName)
@@ -72,15 +87,19 @@ are unchanged.
 
 ```sh
 make                 # builds ./emcm (the context-mixing coder); needs a C compiler
-make test            # unit tests + round trips of both sample corpora
+make test            # unit tests + round trips of the sample corpora, directories and mbox files
 
-python3 emz.py c tests/data/oss_sample.corpus sample.emz      # compress
-python3 emz.py d sample.emz sample.out                        # decompress
-cmp tests/data/oss_sample.corpus sample.out
+python3 emz.py c ~/Maildir mail.emz          # a maildir (or any directory of message files)
+python3 emz.py d mail.emz restored/          # recreates the tree; restored/ must not exist or be empty
+python3 emz.py c archive.mbox archive.emz    # an mbox file
+python3 emz.py d archive.emz archive.mbox
 ```
 
-Input and output use a simple *corpus* format, which works for any maildir
-tree: for each message, `path\n`, `length\n`, then the raw message bytes.
+The input form is detected automatically: a directory (every regular file is
+one message; names, sub-directories and empty directories are kept, file times
+and permissions are not), an mbox file (starts with `From `), a *corpus* file
+(for each message `path\n`, `length\n`, then the raw bytes; the benchmark
+corpora use it), or any other file as a single message.
 
 The full corpora are not stored in this repository. To fetch and serialise
 them:
@@ -140,41 +159,39 @@ There are no copies across mailboxes, which made up half of Enron.
 | 7-Zip PPMd (order 16, 1 GB) | 25.72 | 5.1× | 0.5 | 0.5 | 1.0 |
 | zpaq -m5 | 23.74 | 5.6× | 3.7 | 5.1 | 1.7 |
 | emz version 1¹ | 23.05 | 5.7× | | | |
-| **emz** | **20.24** | **6.53×** | 5.0² | 6.4² | 0.8 |
+| **emz** | **19.92** | **6.63×** | 5.4² | 5.5² | 0.9 |
 
 ¹ Version 1 parsed only Enron's header layout, so every message here took
 the verbatim path: this row is v1's coder on the raw text.
-² Measured while other jobs shared the two cores. An earlier run of almost
-the same code on an otherwise idle machine took 4.0 minutes each way.
+² Measured while lower-priority jobs used the second core.
 
-emz is 14.8% smaller than zpaq -m5, the strongest standard tool here, at
-similar speed. It is 24% smaller than xz -9e and 26% smaller than zstd at its
+emz is 16% smaller than zpaq -m5, the strongest standard tool here, at
+similar speed. It is 25% smaller than xz -9e and 27% smaller than zstd at its
 strongest long-range setting.
 
 #### Where the bits go (recent corpus)
 
 | Stream group | Input to coder (bytes) | Coded (bytes) | Share |
 |---|---:|---:|---:|
-| Body text, including decoded quoted-printable and base64 text parts | 70,066,701 | 9,044,268 | 44.7% |
-| Signature material: base64 runs in DKIM, ARC, Google and Microsoft fields | 7,692,008 | 5,555,340 | 27.5% |
-| Binary attachments (decoded base64) | 4,382,926 | 3,316,550 | 16.4% |
-| Header text not predicted by a model (literals) | 15,318,574 | 2,016,783 | 10.0% |
-| Dates (Date, Received, signature timestamps) | 201,288 | 87,799 | 0.4% |
-| Templates (field-name sequences) | 212,991 | 81,843 | 0.4% |
-| Move-to-front ranks of header values | 507,470 | 65,684 | 0.3% |
-| MIME structure and repeated-body references | 140,598 | 52,636 | 0.3% |
-| Message-IDs, In-Reply-To, References | 79,964 | 16,284 | 0.1% |
-| Path, message kind | 34,162 | 161 | <0.1% |
-| **Total** | 98,636,682 | **20,237,348** | |
+| Body text, including decoded quoted-printable and base64 text parts | 70,143,945 | 8,849,715 | 44.4% |
+| Signature material: base64 runs in DKIM, ARC, Google and Microsoft fields | 7,692,008 | 5,530,741 | 27.8% |
+| Binary attachments (decoded base64) | 4,382,926 | 3,306,549 | 16.6% |
+| Header text not predicted by a model (literals) | 15,318,574 | 1,979,746 | 9.9% |
+| Dates (Date, Received, signature timestamps) | 201,288 | 87,346 | 0.4% |
+| Templates (field-name sequences) | 212,991 | 81,194 | 0.4% |
+| Move-to-front ranks of header values | 507,470 | 65,596 | 0.3% |
+| Message-IDs, In-Reply-To, References | 79,964 | 16,503 | 0.1% |
+| MIME structure and repeated-body references | 80,366 | 6,442 | <0.1% |
+| Path, message kind | 34,162 | 116 | <0.1% |
+| **Total** | 98,653,694 | **19,923,948** | |
 
-The 47.3 MB of raw headers cost 7.8 MB, about 461 bytes per message (Enron:
-10.9 bytes). Of those, 327 bytes are signature material: RSA
-signatures, Microsoft's encrypted anti-spam reports and Google's message
-tokens are random, and base64 of random bytes cannot be coded below 6 bits per
-character (emz reaches 5.8). Another 119 bytes are header text that no model
-predicts: new Message-IDs and Autocrypt public keys (a sixth each), subjects,
-Received lines, what is left of the X-VM-v5-Data cache, and a long tail of
-other fields
+The 47.3 MB of raw headers cost 7.8 MB, about 457 bytes per message (Enron:
+10.6 bytes). Of those, 326 bytes are signature material: RSA signatures,
+Microsoft's encrypted anti-spam reports and Google's message tokens are
+random, and base64 of random bytes cannot be coded below 6 bits per character
+(emz reaches 5.8). Another 117 bytes are header text that no model predicts:
+new Message-IDs and Autocrypt public keys (a sixth each), subjects, Received
+lines, what is left of the X-VM-v5-Data cache, and a long tail of other fields
 ([`results/oss_header_literals_by_field.txt`](results/oss_header_literals_by_field.txt),
 from `scripts/header_literals.py`). Templates, move-to-front ranks, dates and
 thread references take the last 15 bytes.
@@ -183,32 +200,40 @@ thread references take the last 15 bytes.
 
 Structure models and coder, measured separately:
 
-| | Old coder (v1 `emcm`) | New coder (v2 `emcm`) |
+| | Version 1 coder | Current coder |
 |---|---:|---:|
-| Raw corpus, no transform | 23,062,984 | 22,822,567 (−1.0%) |
-| emz version 2 transform | 20,462,115 (−11.3%) | **20,237,556** (−12.3%) |
+| Raw corpus, no transform | 23,062,984 | 22,393,093 (−2.9%) |
+| Current transform | 20,420,192 (−11.5%) | **19,924,181** (−13.6%) |
 
-The coder alone on the raw text already beats zpaq -m5 by 3.9%; the
-structure models remove another 11.3%.
+The coder alone on the raw text already beats zpaq -m5 by 5.7%; the
+structure models remove another 11.0%.
 
-Coder changes, each switched off on its own (12 MB samples of body text; the
-switches are the `EMCM_QM`, `EMCM_WAYS`, `EMCM_SPARSE` and `EMCM_APM2`
-environment variables):
+Coder components, each switched off on its own (12 MB samples of body text
+from each corpus; the switches are environment variables of `emcm`):
 
 | Coder | Enron bodies | Recent bodies |
 |---|---:|---:|
 | version 1 | 1,665,925 | 2,292,081 |
-| **version 2** | **1,654,768 (−0.67%)** | **2,247,645 (−1.94%)** |
-| without the quote-aware match model | +0.46% | +1.84% |
-| without the 4-way bucket search | +0.08% | +0.10% |
-| without sparse insertion in the long match model | +0.08% | +0.06% |
-| without the order-2 APM | +0.08% | +0.01% |
+| **current** | **1,631,303 (−2.08%)** | **2,206,575 (−3.73%)** |
+| without the run model (`EMCM_RUN=0`) | +0.65% | +0.83% |
+| without the third mixer's finer weight sets (`EMCM_M3SEL=0`) | +0.29% | +0.29% |
+| without the learned final mix (`EMCM_FMIX=0`) | +0.23% | +0.33% |
+| order 6 instead of order 5 (`EMCM_CTX=0,1,2,3,4,5,6,7,8`) | +0.12% | +0.08% |
+| without the direct order-1/2 inputs (`EMCM_DIRECT=0`) | +0.09% | +0.18% |
+| without the quote-aware match model (`EMCM_QM=0`) | +0.48% | +1.81% |
+| without the 4-way bucket search (`EMCM_WAYS=2`) | +0.08% | +0.09% |
+| without sparse insertion in the long match model (`EMCM_SPARSE=0`) | +0.08% | +0.06% |
+| without the order-2 APM, and with it the learned final mix (`EMCM_APM2=0`) | +0.32% | +0.37% |
 
-With all four switched off the output is identical to version 1's.
+With the five newest switched off, the coder is the one first released with
+version 2: 1,654,769 and 2,247,646 bytes, one byte away from that coder's
+output because the mixers now add up their inputs in a fixed different order.
+With the last four switched off as well, the model is version 1's.
 
-The last three structure models, added one at a time (the first 1,500
-messages, all from 2015, 7.36 MB; on the full corpus the three together took
-the output from 20,661,082 to 20,237,556 bytes, −2.1%):
+The structure models added since the first version 2 transform, one at a
+time, measured with the coder of that time (the first 1,500 messages, all
+from 2015, 7.36 MB; on the full corpus the three together took the output
+from 20,661,082 to 20,237,556 bytes, −2.1%):
 
 | Step | Size (bytes) | Change |
 |---|---:|---:|
@@ -217,6 +242,14 @@ the output from 20,661,082 to 20,237,556 bytes, −2.1%):
 | + body hash recomputed from the body | 1,063,502 | −0.7% |
 | + fields that repeat other fields or the body size | 1,033,767 | −2.8% |
 | + multipart boundary taken from the body | 1,024,377 | −0.9% |
+
+The latest changes, on both corpora:
+
+| Step | Enron 100 MB subset | Recent, first 1,500 messages |
+|---|---:|---:|
+| version 2 as first released | 5,195,569 | 1,024,377 |
+| + coder: run model, direct inputs, mixer weight sets, learned final mix, order 5 | 5,122,800 (−1.4%) | 1,011,532 (−1.3%) |
+| + end marks instead of lengths for body text | 5,090,615 (−0.6%) | 1,008,184 (−0.3%) |
 
 #### Small sample against the strongest general-purpose CM
 
@@ -227,16 +260,18 @@ The first 1,500 messages of the recent corpus (7.36 MB, all from 2015):
 | zstd --ultra -22 --long=31 | 1,434,277 | 5.1× |
 | xz -9e | 1,390,948 | 5.3× |
 | zpaq -m5 | 1,175,070 | 6.3× |
-| `emcm` alone | 1,161,681 | 6.3× |
-| emz | 1,024,377 | 7.2× |
+| `emcm` alone | 1,137,837 | 6.5× |
+| emz | 1,008,184 | 7.3× |
 | paq8px v217 -8 | 952,713 | 7.7× |
-| **emz transform + paq8px as back end** | **881,698** | **8.4×** |
+| **emz transform¹ + paq8px as back end** | **881,698** | **8.4×** |
 
-paq8px's much stronger models beat emz with `emcm` by 7% here, at 100 times
-the time (26 minutes against 16 seconds). Putting the emz transform in front
-of paq8px makes it another 7.5% smaller, against 2.6% on Enron's 5 MB sample
-(below): the structure models matter more for recent mail, and they add to
-even the strongest CM.
+¹ The version 2 transform as first released.
+
+paq8px's much stronger models beat emz with `emcm` by 5.5% here, at about 70
+times the time (26 minutes against 22 seconds). Putting the emz transform in
+front of paq8px makes it another 7.5% smaller, against 2.6% on Enron's 5 MB
+sample (below): the structure models matter more for recent mail, and they add
+to even the strongest CM.
 
 ### Full Enron corpus
 
@@ -257,36 +292,36 @@ order as `path\n length\n bytes`.
 | zstd --ultra -22 --long=31 | 94.48 | 15.2× | 22.9 | 0.1 | 2.1 |
 | lrzip -z (rzip + ZPAQ) | 80.28 | 17.9× | 7.7 | 7.3 | 1.8 |
 | emz version 1 | 57.35 | 25.1× | 20.2 | 19.8 | 2.6 |
-| **emz** | **55.80** | **25.8×** | 25.9 | 27.1 | 3.1 |
+| **emz** | **54.47** | **26.4×** | 32.4 | 36.2 | 3.2 |
 
-The emz archive (55,796,550 bytes) was written by an `-O3 -march=native` build
+The emz archive (54,470,287 bytes) was written by an `-O3 -march=native` build
 of `emcm` and decoded byte-exact by a separately built generic `-O2` binary;
-other jobs shared the two cores during both runs. emz is 30% smaller than the
-best existing tool (lrzip -z) and 41% smaller than zstd at its strongest
-long-range setting. Version 2 is 2.7% smaller than version 1 on Enron. Two
-thirds of that comes from the coder (the body text stream, the same 467 MB of
-input in both versions, codes 1.06 MB smaller) and one third from the header
-models. The price is speed: a little under 1 MB/s in each direction (27–30
-CPU-minutes each way). That suits archival storage and is far too slow for
-interactive use. paq8px was not feasible on the full corpus: it ran at 5.4
-KB/s, which extrapolates to about 3 days.
+lower-priority jobs used the second core during both runs. emz is 32% smaller
+than the best existing tool (lrzip -z) and 42% smaller than zstd at its
+strongest long-range setting, and 5.0% smaller than version 1. Most of that
+gain comes from the coder: the body text stream, nearly the same 467 MB of
+input in all versions, codes to 48.93 MB instead of 50.83 MB. The price is
+speed: about 0.7 MB/s in each direction (35 CPU-minutes to compress, 38 to
+decompress with the generic build). That suits archival storage and is far too
+slow for interactive use. paq8px was not feasible on the full corpus: it ran
+at 5.4 KB/s, which extrapolates to about 3 days.
 
 #### Where the bits go (Enron)
 
 | Stream group | Input to coder (bytes) | Coded (bytes) | Share |
 |---|---:|---:|---:|
-| Body text (after de-duplication, CRLF and QP decoding) | 467,299,987 | 49,774,140 | 89.2% |
-| Header text not predicted by a model (names, addresses, subjects, …) | 49,154,416 | 4,053,151 | 7.3% |
-| Move-to-front ranks of header values | 5,842,815 | 535,259 | 1.0% |
-| Date | 918,526 | 427,207 | 0.8% |
-| MIME structure, body lengths and repeated-body references | 1,251,146 | 398,930 | 0.7% |
-| Message-ID (generator steps, clock) and thread references | 1,095,373 | 268,423 | 0.5% |
-| Message kind, copies (reference + changed fields), templates | 1,725,016 | 267,096 | 0.5% |
-| Path | 622,764 | 46,868 | <0.1% |
-| Verbatim fallback | 184,012 | 25,268 | <0.1% |
-| **Total** | 528,094,055 | **55,796,342** | |
+| Body text (after de-duplication, CRLF and QP decoding) | 467,797,911 | 48,933,480 | 89.8% |
+| Header text not predicted by a model (names, addresses, subjects, …) | 49,154,416 | 3,935,710 | 7.2% |
+| Move-to-front ranks of header values | 5,842,815 | 535,900 | 1.0% |
+| Date | 918,526 | 426,063 | 0.8% |
+| Message-ID (generator steps, clock) and thread references | 1,095,373 | 268,055 | 0.5% |
+| Message kind, copies (reference + changed fields), templates | 1,725,016 | 264,177 | 0.5% |
+| Path | 622,764 | 46,628 | <0.1% |
+| MIME structure and repeated-body references | 778,424 | 34,931 | <0.1% |
+| Verbatim fallback | 184,012 | 25,102 | <0.1% |
+| **Total** | 528,119,257 | **54,470,046** | |
 
-The 462 MB of raw headers code to 5.6 MB, about 10.9 bytes per message
+The 462 MB of raw headers code to 5.5 MB, about 10.6 bytes per message
 (version 1: 11.8), including 0.5 bytes per Message-ID. What remains is almost
 entirely first-occurrence body text.
 
@@ -319,8 +354,8 @@ step adds one component:
 | + header/body separation | 5,838,565 | −2.3% |
 | + message and body de-duplication | 5,597,695 | −6.3% |
 | + field models, QP decoding, PRNG Message-ID (emz version 1) | 5,310,297 | −11.1% |
-| version 1 transform with the version 2 coder | 5,270,652 | −11.8% |
-| **emz version 2** | **5,195,569** | **−13.1%** |
+| version 1 transform with the current coder | 5,200,448 | −13.0% |
+| **emz (current)** | **5,090,615** | **−14.8%** |
 
 The subset is the first 100 MB in path order: 12 mailboxes, allen-p through
 part of buy-r. It has fewer cross-mailbox copies than the full archive, so the
@@ -351,7 +386,7 @@ Effects of individual version 1 models, measured on the subset:
 | lrzip -z (ZPAQ) | 6,930,535 | 14.4× |
 | `emcm` (version 1) alone | 5,976,320 | 16.7× |
 | emz version 1 | 5,310,297 | 18.8× |
-| **emz** | **5,195,569** | **19.2×** |
+| **emz** | **5,090,615** | **19.6×** |
 
 #### Small Enron sample against the strongest general-purpose CM (5 MB, 2,835 messages)
 
@@ -359,13 +394,15 @@ Effects of individual version 1 models, measured on the subset:
 |---|---:|---:|
 | paq8px v217 -8 | 275,520 | 15 min |
 | **emz version 1 transform + paq8px as back end** | **268,245** | ≈7 min |
-| emz | 318,491 | 4 s |
+| emz | 312,383 | 8 s¹ |
 | emz version 1 | 327,403 | 4 s |
-| `emcm` alone | 355,315 | 11 s |
+| `emcm` alone | 349,469 | 19 s¹ |
 | zpaq -m5 | 362,869 | 15 s |
 | lrzip -z | 410,816 | 2 s |
 | xz -9e | 471,456 | 2 s |
 | zstd -22 --long=31 | 494,841 | 4 s |
+
+¹ Measured while another job ran on the second core.
 
 On a sample this small there is little duplication, and paq8px's much stronger
 text model beats emz with `emcm`. Putting the emz transform in front of paq8px
@@ -391,7 +428,7 @@ of the corpus. These experiments used version 1 of the field models.
 | primed `emcm` (model trained on 32 MB of mail, then frozen) | 6.75×¹ |
 | field transform + primed `emcm` | 7.89×¹ ² |
 | + single-instance storage of repeated content (a copy = reference + its own Message-ID and folder fields) | **14.3×¹ ²** |
-| *emz, solid archive (for comparison)* | *25.8× (version 1: 25.1×)* |
+| *emz, solid archive (for comparison)* | *26.4× (version 1: 25.1×)* |
 
 ¹ Measured on the 1% subsample. On that subsample, zstd with the 110 KB
 dictionary gives 3.44×. The single-instance row also charges a 2-byte length
@@ -419,13 +456,18 @@ independently readable.
 * **Lossless by construction.** Every parsed field and every decoded MIME
   part is re-serialised and compared with the original before its model is
   used. Both full-corpus round trips are SHA-256 identical.
-* **Resources.** About 3.1 GB of RAM in each direction for Enron: the 2 GB
-  hash table for the body model, plus a quote-stripped copy of the body text
-  (0.47 GB) for the quote-aware match model. The recent corpus needs 0.8 GB.
+* **Resources.** About 3.2 GB of RAM in each direction for Enron: the 2 GB
+  hash table for the body model, a quote-stripped copy of the body text
+  (0.47 GB) for the quote-aware match model, and smaller tables (the run
+  model's is 64 MB). The recent corpus needs 0.9 GB.
   The decoder must rebuild all earlier messages (no random access).
-* **Back end.** On the same body text, paq8px's output is about 17% smaller
-  than `emcm`'s. A stronger body model, such as an LSTM or paq8-style word and
-  indirect models, would shrink the dominant body share directly.
+* **Back end.** On the same body text, paq8px's output is 13–17% smaller
+  than `emcm`'s (samples of both corpora). A stronger body model, such as an
+  LSTM or paq8-style word and indirect models, would shrink the dominant body
+  share directly.
+* **Directories.** File names, the directory structure and empty directories
+  are restored; file times, permissions and links are not (a symbolic link in
+  the input is an error).
 * **What cannot be compressed.** Cryptographic signatures, encrypted
   anti-spam reports and already-compressed attachments are close to random.
   On the recent corpus they set a floor of roughly 8–9 MB, over 40% of emz's
@@ -457,6 +499,9 @@ coder then entropy-codes each stream.
 
 ### 1. Parsing and the verbatim fallback
 
+* Directory trees are read in natural path order (`2.` before `10.`). In an
+  mbox file a message starts at every line that begins with `From `; that
+  line is coded on its own (table below) and the rest is the message.
 * The header ends at the first empty line. Each field line must be
   `Name: value` (or `Name:value`), possibly folded with continuation lines
   that start with a space or tab. The line ending (CRLF or LF) is taken from
@@ -491,6 +536,7 @@ these can refer to everything else.
 |---|---|
 | Field-name sequence | Move-to-front list of the last 254 templates (name sequence plus `Name:value` spacing); a new template is coded name by name |
 | Path | same folder and next file number → one symbol; otherwise folder name and number |
+| mbox `From ` line | Sender as a reference to Return-Path, From or X-GM-THRID, else a move-to-front value; time in seconds relative to the topmost Received header (else Date); format (day padding, time zone, trailing text, line end) as a move-to-front value. Lines of any other shape are stored as they are |
 | Message-ID, In-Reply-To, References | IDs are tokens; a token seen before is coded as the distance to its last occurrence. References are predicted as the parent's References followed by the parent's ID, In-Reply-To as the last reference |
 | Message-ID `<N1.N2.JavaMail.evans@thyme>` (Enron) | **N2** is the converter's millisecond clock and is coded as a delta (≈23 ms per message). **N1** is the low 25 bits of the JVM's Park–Miller generator *x → 16807·x mod (2³¹−1)*, which advances once per message. The model keeps the full 31-bit state and codes N1 as the number of generator steps (almost always 1); the hidden 6 bits are recovered once per folder. Cost falls from 25 bits to ≈0.6 bits per message |
 | Date | Parsed to minutes, seconds and time zone; weekday and zone name are derived. Coded as a minute delta from the previous message in the same folder, and verified by re-serialising. The format variant (weekday or not, seconds or not, zone comment) is a move-to-front symbol |
@@ -523,6 +569,9 @@ sees each kind of literal on its own.
   stream. A part that no variant reproduces is kept as encoded text.
 * **Line endings**: CRLF text is stored with LF plus a flag when that is
   reversible.
+* **Ends of text.** Every text part ends with a two-byte mark in the body
+  text stream (a zero byte inside the text is escaped), so no length is
+  stored and the coder learns how bodies end. Binary parts keep a length.
 * Bodies are concatenated in archive order (owner → folder → number for
   Enron, date for the list archive). Re-ordering Enron by date or by thread
   was tested; neither helped, and date order was 1.1% worse.
@@ -532,13 +581,18 @@ sees each kind of literal on its own.
 `emcm.c` is a bitwise context-mixing coder in the paq/lpaq family, written for
 this project:
 
-* Contexts: orders 1, 2, 3, 4, 6, 8; current word; word bigram; column with
+* Contexts: orders 1, 2, 3, 4, 5, 8; current word; word bigram; column with
   the byte above (for tables and quoted blocks). They live in nibble-bucketed
   hash tables (16-byte buckets, checksum, 4-way search, replacement by
   priority).
 * Each context node holds a bit-history state, an (n0, n1) pair with
   non-stationary discounting. Adaptive StateMaps map states to probabilities,
   giving two inputs per context.
+* A run model remembers, for each context, the last byte seen there and how
+  many times in a row it occurred (a table of 32-bit slots, 1/32 of the main
+  table's size); while the bits of the current byte agree with that byte, it
+  adds one input per context whose weight a StateMap learns by run length.
+* Direct (unhashed) tables for order 1 and order 2 add two more inputs.
 * Two match models (minimum lengths 6 and 24) index the whole stream history;
   the long one indexes every 4th position. A third match model works on the
   text with quote prefixes (`> `, `>> `, `> > `) removed, so a quoted reply
@@ -546,9 +600,11 @@ this project:
   differently. Quoted replies and forwards that repeat earlier mail cost about
   0.05 bit/char.
 * Three gated logistic mixers (selected by partial byte, match state × number
-  of known contexts × quote-match state, and previous byte × bit position)
+  of known contexts × quote-match state, and previous byte × partial byte)
   feed a final mixer, followed by four APM/SSE stages (order 0, order 1,
-  order 2, match byte). The arithmetic coder uses 12-bit probabilities.
+  order 2, match byte). Their outputs are averaged with fixed weights and,
+  in parallel, combined by a small learned mixer; the two results are
+  averaged. The arithmetic coder uses 12-bit probabilities.
 * The body stream gets up to a 2 GB hash table; smaller streams get tables
   sized to their length. Streams are coded in parallel (two workers).
 
@@ -582,10 +638,12 @@ this project:
 
 `emcm` mixes predictions with float arithmetic. An archive decodes only with
 a build that rounds identically, so the Makefile disables fused multiply-add
-contraction (`-ffp-contract=off`). With GCC's default contraction and
-`-march=native`, archives would not decode with a differently built binary.
-CI checks that archives written by an `-O3` build decode with an `-O1`
-build, on both x86-64 and arm64.
+contraction (`-ffp-contract=off`), and the mixers add up their inputs in 8
+partial sums in a fixed order, which the compiler may vectorize without
+changing the result. With GCC's default contraction and `-march=native`,
+archives would not decode with a differently built binary. CI checks that
+archives written by an `-O3` build decode with an `-O1` build, on both x86-64
+and arm64, and every decompression checks the SHA-256 of the original input.
 
 ## License and credits
 

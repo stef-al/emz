@@ -31,7 +31,7 @@ Scripts: `scripts/permsg.py` (baselines), `scripts/permsg_analysis.py`,
 | gzip -6 | 2.22× |
 | zstd -19 | 2.22× |
 | brotli -11 (has a built-in static dictionary) | 2.66× |
-| *emz on the whole archive, for reference (version 1 / version 2)* | *25.1× / 25.8×* |
+| *emz on the whole archive, for reference (version 1 / current)* | *25.1× / 26.4×* |
 
 The average message is 2.75 KB, too short for an adaptive compressor to learn
 much. The archive coder's tenfold advantage comes almost entirely from

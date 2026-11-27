@@ -99,10 +99,121 @@ class ArchiveRoundTrip(unittest.TestCase):
             self.assertGreater(os.path.getsize(corpus) / os.path.getsize(arc), min_ratio)
 
     def test_enron_sample(self):
-        self.roundtrip(ENRON, 15)          # about 18.9x
+        self.roundtrip(ENRON, 15)          # about 19x
 
     def test_oss_sample(self):
-        self.roundtrip(OSS, 4.2)           # about 4.46x (binary attachments, signatures)
+        self.roundtrip(OSS, 4.3)           # about 4.5x (binary attachments, signatures)
+
+
+def emz_run(*args, check=True):
+    env = dict(os.environ, EMCM=EMCM)
+    return subprocess.run([sys.executable, os.path.join(ROOT, "emz.py")] + list(args), check=check, env=env,
+                          capture_output=True)
+
+
+def tree(root):
+    """{relative path: bytes} for files, plus the set of empty directories."""
+    files, empty = {}, set()
+    for dp, dns, fns in os.walk(root):
+        rel = os.path.relpath(dp, root)
+        if not dns and not fns and rel != ".":
+            empty.add(rel)
+        for fn in fns:
+            files[os.path.normpath(os.path.join(rel, fn))] = read(os.path.join(dp, fn))
+    return files, empty
+
+
+def asctime(t, zero_pad=False):
+    tm = __import__("time").gmtime(t)
+    day = ("%02d" if zero_pad else "%2d") % tm.tm_mday
+    return __import__("time").strftime("%a %b ", tm) + day + __import__("time").strftime(" %H:%M:%S %Y", tm)
+
+
+class InputForms(unittest.TestCase):
+    """Directory trees, mbox files and single messages are restored exactly."""
+
+    def test_directory_tree(self):
+        msgs = [m for _, m in emz.iter_corpus(ENRON)][:60]
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "Maildir")
+            for i, m in enumerate(msgs):
+                sub = ("cur", "new", ".Sent/cur")[i % 3]
+                os.makedirs(os.path.join(src, sub), exist_ok=True)
+                write(os.path.join(src, sub, "%d.%d.host:2,S" % (1000 + i, i)), m)
+            for e in ("tmp", ".Sent/tmp", ".Sent/new", "a/b/c"):
+                os.makedirs(os.path.join(src, e))
+            write(os.path.join(src, "cur", "empty file"), b"")
+            os.makedirs(os.path.join(src.encode(), b"caf\xe9"))
+            write(os.path.join(src.encode(), b"caf\xe9", b"\xff name"), msgs[0])
+            arc, out = os.path.join(d, "a.emz"), os.path.join(d, "restored")
+            emz_run("c", src, arc)
+            emz_run("d", arc, out)
+            self.assertEqual(tree(out), tree(src))
+            r = emz_run("d", arc, out, check=False)          # refuses to write into a non-empty directory
+            self.assertNotEqual(r.returncode, 0)
+
+    def test_mbox(self):
+        parts = []
+        for i, (_, m) in enumerate(emz.iter_corpus(OSS)):
+            if i >= 80:
+                break
+            p = emz.parse_message(m)
+            vals = {n.lower(): v for n, _, v in p[1]} if p else {}
+            rp = vals.get(b"return-path", b"<>").strip(b"<> ") or b"MAILER-DAEMON"
+            recv = vals.get(b"received", b"")
+            d = emz.parse_date(recv[recv.rfind(b";") + 1:].replace(b"\n", b"").strip()) if b";" in recv else None
+            t = emz.utc_seconds(d) + 3600 + i if d else 1500000000 + 1000 * i
+            if i % 7 == 3:                                # Gmail Takeout style
+                env = b"From 17%017d@xxx %s +0000 %s\n" % (i, asctime(t, True)[:-5].encode(), asctime(t)[-4:].encode())
+            elif i % 11 == 5:
+                env = b"From - " + asctime(t).encode() + b"\n"   # Thunderbird
+            elif i == 9:
+                env = b"From a weird envelope line\n"
+            else:
+                env = b"From " + rp + b" " + asctime(t).encode() + b"\n"
+            body = re.sub(rb"(?m)^From ", b">From ", m)
+            parts.append(env + body + b"\n")
+        parts.append(b"From x@y Mon Jan  1 00:00:00 2001\r\nSubject: crlf\r\n\r\nhi\r\n")
+        parts.append(b"From x@y Mon Jan  1 00:00:00 2001\n")              # empty message
+        parts.append(b"From x@y Tue Feb 30 00:00:00 2001\nSubject: bad date\n\nno final newline")
+        data = b"".join(parts)
+        with tempfile.TemporaryDirectory() as d:
+            src, arc, out = (os.path.join(d, x) for x in ("in.mbox", "a.emz", "out.mbox"))
+            write(src, data)
+            r = emz_run("c", src, arc)
+            self.assertIn(b"mbox", r.stderr)
+            emz_run("d", arc, out)
+            self.assertEqual(read(out), data)
+
+    def test_single_message_and_corrupt_archive(self):
+        m = [m for _, m in emz.iter_corpus(OSS)][5]
+        with tempfile.TemporaryDirectory() as d:
+            src, arc, out = (os.path.join(d, x) for x in ("one.eml", "a.emz", "out.eml"))
+            write(src, m)
+            emz_run("c", src, arc)
+            emz_run("d", arc, out)
+            self.assertEqual(read(out), m)
+            data = bytearray(read(arc))
+            data[-40] ^= 0x10                              # flip one bit in the coded data
+            write(arc, bytes(data))
+            r = emz_run("d", arc, out, check=False)
+            self.assertNotEqual(r.returncode, 0)
+
+    def test_unsafe_paths_are_refused(self):
+        for bad in (b"../x", b"/etc/passwd", b"a/../../b", b"a//b", b"./a", b"a/\0b"):
+            with self.assertRaises(SystemExit):
+                emz.safe_relpath(bad)
+        self.assertEqual(emz.safe_relpath(b"cur/1.2.host:2,S"), b"cur/1.2.host:2,S")
+
+    def test_large_streams_are_split(self):
+        with tempfile.TemporaryDirectory() as d:
+            arc, out = os.path.join(d, "a.emz"), os.path.join(d, "out")
+            env = dict(os.environ, EMCM=EMCM, EMZ_CHUNK="100000")
+            subprocess.run([sys.executable, os.path.join(ROOT, "emz.py"), "c", ENRON, arc], check=True, env=env,
+                           capture_output=True)
+            subprocess.run([sys.executable, os.path.join(ROOT, "emz.py"), "d", arc, out], check=True, env=env,
+                           capture_output=True)
+            self.assertEqual(read(out), read(ENRON))
 
 
 class FieldModels(unittest.TestCase):

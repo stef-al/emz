@@ -1,4 +1,4 @@
-emz version 2 on enron.corpus (compressed with an -O3 -march=native build of emcm, decompressed with a separately built -O2 generic build; other jobs shared the 2 cores)
-compress: 1556.34 1627.32 5.55 3268736
-decompress: 1628.90 1773.47 6.05 3268580
+emz version 2 on enron.corpus (compressed with an -O3 -march=native build of emcm, decompressed with a separately built -O2 generic build; lower-priority jobs used the second core)
+compress: 1946.90 2105.96 6.79 3361056
+decompress: 2172.13 2300.74 5.97 3360944
 format: wall_s user_s sys_s peak_rss_kB

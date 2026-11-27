@@ -1,4 +1,4 @@
-entropy decoding 362.2s  inverse transform 24.1s
+entropy decoding 315.2s  inverse transform 15.1s  (SHA-256 verified)
 decompress exit 0
 1b3c992464f4f960ec4526119b826e9ec32b63db040e911ebaa1857f030bd9f8  oss.dec
 1b3c992464f4f960ec4526119b826e9ec32b63db040e911ebaa1857f030bd9f8  oss_full.corpus

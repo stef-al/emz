@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """emz -- structure-aware compressor for e-mail archives.
 
-    emz.py c <corpus> <archive>     compress a corpus file
-    emz.py d <archive> <corpus>     decompress
+    emz.py c <input> <archive>      compress
+    emz.py d <archive> <output>     decompress (restores the input's form)
 
-A corpus is a sequence of messages: `path\\n`, `length\\n`, raw bytes (see
-README).  Every message is parsed into header fields and body.  The field-name
+The input is a directory tree of message files (maildir, MH, ...), an mbox
+file, a corpus file (`path\\n`, `length\\n`, raw bytes per message; see
+README) or a single message.  Every message is parsed into header fields and
+body; an mbox `From ` line is coded against the message's own Return-Path and
+Received date.  The field-name
 sequence is coded as a template; each field is coded by a model chosen by its
 name (dates as numbers, Message-IDs as references to earlier messages,
 References/In-Reply-To against the parent message, Subject against the
@@ -24,7 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qp import qp_decode, qp_encode, QP_VARIANTS
 
 EMCM = os.environ.get("EMCM", os.path.join(os.path.dirname(os.path.abspath(__file__)), "emcm"))
-MAGIC = b"EMZ3"
+MAGIC = b"EMZ4"
+KIND_CORPUS, KIND_MBOX, KIND_DIR, KIND_FILE = 0, 1, 2, 3
+KIND_NAMES = {KIND_CORPUS: "corpus file", KIND_MBOX: "mbox", KIND_DIR: "directory", KIND_FILE: "single message"}
+CHUNK = int(os.environ.get("EMZ_CHUNK", str(1 << 31)))   # streams are split into parts of at most 2 GiB
 
 # --------------------------------------------------------------------------
 # byte streams
@@ -38,6 +44,8 @@ class WStream:
     def sint(self, v): self.uint((v << 1) if v >= 0 else ((-v << 1) - 1))
     def text(self, s): self.b += s; self.b.append(10)          # s: bytes without '\n'
     def blob(self, s): self.b += s
+    def text_end(self, s):               # any bytes; 00 is escaped as 00 01, the end mark is 00 00
+        self.b += s.replace(b"\0", b"\0\1"); self.b += b"\0\0"
 
 class RStream:
     def __init__(self, data): self.b = data; self.p = 0
@@ -53,13 +61,21 @@ class RStream:
         u = self.uint(); return (u >> 1) if not (u & 1) else -((u + 1) >> 1)
     def text(self):
         i = self.b.index(10, self.p); s = bytes(self.b[self.p:i]); self.p = i + 1; return s
+    def until_end(self):
+        """Text written by WStream.text_end: bytes up to the end mark."""
+        b = self.b; out = []; p = self.p
+        while True:
+            i = b.index(0, p)
+            out.append(b[p:i])
+            if b[i + 1] == 0: self.p = i + 2; return b"\0".join(out)
+            p = i + 2
     def blob(self, n):
         s = bytes(self.b[self.p:self.p + n]); self.p += n; return s
 
 STREAMS = ["path", "kind", "dupref", "diff", "tmpl_r", "tmpl_l",
            "hdr_r", "hdr_l", "sig_r", "sig_l", "addr_r", "xal_r", "subj_r",
            "id_r", "mid1", "mid2", "date", "dsec", "dfmt_r", "rdate",
-           "seg", "bodyref", "body", "bin", "raw"]
+           "seg", "bodyref", "body", "bin", "raw", "env_r", "env_l", "env_d"]
 
 # --------------------------------------------------------------------------
 class Recency:
@@ -113,6 +129,18 @@ def civil_from_days(z):
     d = doy - (153 * mp + 2) // 5 + 1
     m = mp + (3 if mp < 10 else -9)
     return y + (m <= 2), m, d
+
+ENV_RE = re.compile(rb"^From (\S*)( +)(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+                    rb"( \d|\d\d?) (\d\d):(\d\d):(\d\d)( [+-]\d{4})? (\d{4})( [+-]\d{4})?(.*)$", re.S)
+
+def render_envelope(sender, sep, t, style, zone1, zone2, rest):
+    """mbox `From ` line (without its line end) for a time t in seconds;
+    style: day padded with a space (0), with a zero (1), or not at all (2)."""
+    days, sec = divmod(t, 86400)
+    y, m, d = civil_from_days(days)
+    day = (b"%2d", b"%02d", b"%d")[style] % d
+    return b"From %s%s%s %s %s %02d:%02d:%02d%s %d%s%s" % (sender, sep, DOWS[(days + 3) % 7], MONTHS[m - 1], day,
+                                                          sec // 3600, sec // 60 % 60, sec % 60, zone1, y, zone2, rest)
 
 def parse_date(v):
     """RFC 5322 date -> (local minutes, seconds, fmt) if it re-serialises
@@ -415,6 +443,7 @@ class Codec:
         self.rc_tmpl = Recency(254); self.rc_fname = Recency(254)
         self.rc = Recency(8); self.rc_big = Recency(64); self.rc_small = Recency(4)
         self.rc_name = Recency(4); self.rc_dfmt = Recency(16)
+        self.env_style = 0
 
     # ---------------- path ----------------
     def code_path(self, path=None):
@@ -466,25 +495,31 @@ class Codec:
         return tok
 
     # ---------------- per message ----------------
-    def code_message(self, path=None, msg=None):
+    def code_message(self, path=None, msg=None, env=None):
+        """Encoder: code one message (env: its mbox `From ` line or None).
+        Decoder: return (path, message, env)."""
         path = self.code_path(path)
         K = self.S["kind"]
         folder = path.rpartition("/")[0]; user = path.split("/")[0]
         if self.enc:
+            has_env = env is not None
             P = parse_message(msg)
             if P is None:
-                K.byte(2); self.S["raw"].uint(len(msg)); self.S["raw"].blob(msg)
+                K.byte(2 | 8 * has_env); self.S["raw"].uint(len(msg)); self.S["raw"].blob(msg)
+                if has_env: self.code_envelope(env, None, None)
                 return path, msg
             crlf, fields, body = P
             tmpl = tuple((n, sp) for n, sp, _ in fields); vals = [v for _, _, v in fields]
             key = hashlib.md5(b"\0".join([bytes([crlf])] + [n + bytes([1 + sp]) + (v if n.lower() not in VOLATILE else b"")
                                                             for (n, sp), v in zip(tmpl, vals)]) + b"\0" + body).digest()
             cid = self.content.get(key)
-            K.byte(crlf * 4 + (1 if cid is not None else 0))
+            K.byte(crlf * 4 + (1 if cid is not None else 0) + 8 * has_env)
         else:
             t = K.byte()
+            has_env = t >= 8; t &= 7
             if t == 2:
-                n = self.S["raw"].uint(); return path, self.S["raw"].blob(n)
+                n = self.S["raw"].uint(); m = self.S["raw"].blob(n)
+                return path, m, (self.code_envelope(None, None, None) if has_env else None)
             crlf = t >> 2; cid = None; tmpl = vals = body = None
         self.eol = b"\r\n" if crlf else b"\n"
         self.cur = {"folder": folder, "user": user, "utc": None, "refs": None, "parent": None, "vals": {},
@@ -555,8 +590,71 @@ class Codec:
         if mid is not None and MID_TOKEN.match(mid):
             s = self.cur["vals"].get(b"subject")
             self.msginfo[mid] = (SUBJ_PFX.sub(b"", self.lit(s), 1) if s is not None else None, self.cur["refs"])
+        env = self.code_envelope(env, lnames, out) if has_env else None
         if self.enc: return path, msg
-        return path, render_message(crlf, tmpl, out, body)
+        return path, render_message(crlf, tmpl, out, body), env
+
+    def code_envelope(self, env, lnames, out):
+        """mbox `From <sender> <asctime>` line.  The time is coded in seconds
+        relative to the topmost Received header (else Date), so the delivery
+        delay and the delivering host's zone offset are what remains; the
+        sender may refer to Return-Path, From or X-GM-THRID.  Lines of another
+        shape are stored as they are."""
+        E, L, D = self.S["env_r"], self.S["env_l"], self.S["env_d"]
+        ref = self.last_utc; k = {}
+        if lnames is not None:
+            vals = {}
+            for ln, v in zip(lnames, out): vals.setdefault(ln, v)
+            rv = vals.get(b"received")
+            p = parse_date(rv[rv.rfind(b";") + 1:].replace(self.eol, b"").strip()) if rv and b";" in rv else None
+            if p: ref = utc_seconds(p)
+            elif self.cur["utc"] is not None: ref = self.cur["utc"]
+            def addr(v):
+                v = (v or b"").replace(self.eol, b"").strip()
+                m = ANGLE_ADDR.search(v)
+                return m.group(1) if m else (v if b" " not in v else b"")
+            for code, x in ((b"R", addr(vals.get(b"return-path"))), (b"F", addr(vals.get(b"from"))),
+                            (b"T", (vals.get(b"x-gm-thrid") or b"").strip())):
+                if len(x) >= 2 and not any(c in x for c in (b"\x06", b"\n", b"\x00")) and x not in k.values(): k[code] = x
+        if self.enc:
+            if env.endswith(b"\r\n"): line, eolc = env[:-2], 1
+            elif env.endswith(b"\n"): line, eolc = env[:-1], 0
+            else: line, eolc = env, 2
+            m = ENV_RE.match(line) if not any(c in line for c in (b"\x00", b"\x06", b"\n")) else None
+            t = None
+            if m:
+                day = m.group(5)
+                style = 0 if day[:1] == b" " else 1 if day[:1] == b"0" else 2 if len(day) == 1 else self.env_style
+                hh, mi, ss, d = int(m.group(6)), int(m.group(7)), int(m.group(8)), int(day)
+                if hh < 24 and mi < 60 and ss < 60 and 1 <= d <= 31:
+                    t = (days_from_civil(int(m.group(10)), MONTHS.index(m.group(4)) + 1, d) * 86400 +
+                         hh * 3600 + mi * 60 + ss)
+                    parts = (m.group(1), m.group(2), style, m.group(9) or b"", m.group(11) or b"", m.group(12))
+                    if render_envelope(parts[0], parts[1], t, *parts[2:]) != line: t = None
+            if t is None:
+                E.byte(0); D.uint(len(env)); L.blob(env)
+                return env
+            E.byte(1)
+            inv = {x: c for c, x in k.items()}
+            alts = sorted(k.values(), key=len, reverse=True)
+            rx = re.compile(b"|".join((rb"(?<!\d)" + re.escape(x) + rb"(?!\d)") if x.isdigit() else re.escape(x)
+                                      for x in alts)) if alts else None
+            snd = rx.sub(lambda mm: b"\x06" + inv[mm.group(0)], parts[0]) if rx else parts[0]
+            self.rc_small.code(True, (b"envs",), E, L, snd)
+            fmt = b"%d%d" % (style, eolc) + b"\x00".join(parts[1:2] + parts[3:])
+            self.rc_dfmt.code(True, 3, E, L, fmt)
+            D.sint(t - ref)
+            self.env_style = style
+            return env
+        if not E.byte():
+            return L.blob(D.uint())
+        snd = GEN_MARK.sub(lambda mm: k[mm.group(1)], self.rc_small.code(False, (b"envs",), E, L))
+        fmt = self.rc_dfmt.code(False, 3, E, L)
+        style, eolc = fmt[0] - 48, fmt[1] - 48
+        sep, z1, z2, rest = fmt[2:].split(b"\x00", 3)
+        self.env_style = style
+        line = render_envelope(snd, sep, ref + D.sint(), style, z1, z2, rest)
+        return line + (b"\n", b"\r\n", b"")[eolc]
 
     def code_template(self, tmpl=None):
         S = self.S
@@ -943,14 +1041,15 @@ class Codec:
                     # CRLF text is stored with LF when that is reversible
                     lf = eol == b"\r\n" and b"\r" not in p.replace(b"\r\n", b"") and b"\n" not in p.replace(b"\r\n", b"")
                     t = p.replace(b"\r\n", b"\n") if lf else p
-                    G.byte(0 + lf); G.uint(len(t)); self.S["body"].blob(t)
+                    G.byte(0 + lf); self.S["body"].text_end(t)
                 elif kind == "Q":
-                    G.byte(2); G.byte(p[0]); G.uint(len(p[1])); self.S["body"].blob(p[1])
+                    G.byte(2); G.byte(p[0]); self.S["body"].text_end(p[1])
                 else:
                     L, t, dec = p
                     txt = looks_text(dec)
-                    G.byte(4 + txt); G.uint(L // 4); G.byte(t); G.uint(len(dec))
-                    self.S["body" if txt else "bin"].blob(dec)
+                    G.byte(4 + txt); G.uint(L // 4); G.byte(t)
+                    if txt: self.S["body"].text_end(dec)
+                    else: G.uint(len(dec)); self.S["bin"].blob(dec)
             self.bodies[h] = self.nbodies; self.nbodies += 1; self.bodylist.append(None)
             return body
         r = R.uint()
@@ -959,13 +1058,14 @@ class Codec:
         for _ in range(G.uint()):
             kind = G.byte()
             if kind <= 1:
-                t = self.S["body"].blob(G.uint())
+                t = self.S["body"].until_end()
                 out.append(t.replace(b"\n", b"\r\n") if kind == 1 else t)
             elif kind == 2:
-                var = G.byte(); dec = self.S["body"].blob(G.uint())
+                var = G.byte(); dec = self.S["body"].until_end()
                 out.append(qp_encode(dec, eol, *QP_VARIANTS[var & 7], var >= 8))
             else:
-                L = G.uint() * 4; t = G.byte(); dec = self.S["body" if kind == 5 else "bin"].blob(G.uint())
+                L = G.uint() * 4; t = G.byte()
+                dec = self.S["body"].until_end() if kind == 5 else self.S["bin"].blob(G.uint())
                 out.append(b64_render(dec, L, t, eol))
         body = b"".join(out)
         self.bodylist.append(body); self.nbodies += 1
@@ -980,6 +1080,97 @@ def iter_corpus(fn):
             n = int(f.readline())
             yield p[:-1].decode("latin-1"), f.read(n)
 
+# --------------------------------------------------------------------------
+# input forms: corpus file, mbox, directory tree, single message
+def is_corpus(fn):
+    """True if fn consists exactly of records `path\n`, `length\n`, bytes."""
+    size = os.path.getsize(fn)
+    if size == 0: return False
+    with open(fn, "rb") as f:
+        while f.tell() < size:
+            if not f.readline().endswith(b"\n"): return False
+            ln = f.readline()
+            if not ln.endswith(b"\n") or not ln[:-1].isdigit(): return False
+            end = f.tell() + int(ln)
+            if end > size: return False
+            f.seek(end)
+    return True
+
+def natural_key(name):
+    return [(0, int(x), b"") if x.isdigit() else (1, 0, x) for x in re.split(rb"(\d+)", name)]
+
+def walk_dir(root):
+    """Regular files under root in natural path order, and the empty
+    directories; paths are relative and '/'-separated (bytes)."""
+    import stat
+    root = os.fsencode(root)
+    files, empty = [], []
+    def visit(rel):
+        full = os.path.join(root, rel) if rel else root
+        names = sorted(os.listdir(full), key=natural_key)
+        if not names and rel: empty.append(rel)
+        for nm in names:
+            r = rel + b"/" + nm if rel else nm
+            st = os.lstat(os.path.join(root, r))
+            if stat.S_ISDIR(st.st_mode): visit(r)
+            elif stat.S_ISREG(st.st_mode): files.append(r)
+            else: raise SystemExit("emz: not a regular file or directory: %s" % os.fsdecode(os.path.join(root, r)))
+    visit(b"")
+    return files, empty
+
+def split_mbox(data):
+    """mbox -> (From_ line with its line end, message) pairs: a message
+    starts at every line that begins with 'From '."""
+    starts = [0] + [m.start() + 1 for m in re.finditer(rb"\nFrom ", data)]
+    for a, b in zip(starts, starts[1:] + [len(data)]):
+        e = data.find(b"\n", a, b)
+        e = b if e < 0 else e + 1
+        yield data[a:e], data[e:b]
+
+def safe_relpath(rel):
+    """A relative path from an archive may not leave the output directory."""
+    parts = rel.split(b"/")
+    if rel.startswith(b"/") or any(p in (b"", b".", b"..") or b"\0" in p for p in parts):
+        raise SystemExit("emz: refusing unsafe path in archive: %r" % rel)
+    return rel
+
+def detect_kind(path):
+    if os.path.isdir(path): return KIND_DIR
+    with open(path, "rb") as f: head = f.read(5)
+    if head == b"From ": return KIND_MBOX
+    return KIND_CORPUS if is_corpus(path) else KIND_FILE
+
+class Hasher:
+    """SHA-256 of the canonical serialisation of an input (its bytes for
+    files; for a directory every file as `path\n`, `length\n`, bytes, then
+    `\0D path\n` per empty directory)."""
+    def __init__(self): self.h = hashlib.sha256()
+    def add(self, b): self.h.update(b)
+    def record(self, path, data): self.h.update(path + b"\n" + str(len(data)).encode() + b"\n"); self.h.update(data)
+    def digest(self): return self.h.digest()
+
+def iter_input(path, kind, H):
+    """-> (path str, message, mbox From_ line or None) for every message,
+    feeding the canonical serialisation into the hasher H."""
+    if kind == KIND_CORPUS:
+        for p, m in iter_corpus(path):
+            H.record(p.encode("latin-1"), m); yield p, m, None
+    elif kind == KIND_MBOX:
+        with open(path, "rb") as f: data = f.read()
+        H.add(data)
+        for i, (env, m) in enumerate(split_mbox(data)): yield "mbox/%d." % (i + 1), m, env
+    elif kind == KIND_FILE:
+        with open(path, "rb") as f: data = f.read()
+        H.add(data)
+        yield os.path.basename(path), data, None
+    else:
+        files, _ = walk_dir(path)
+        for r in files:
+            with open(os.path.join(os.fsencode(path), r), "rb") as f: data = f.read()
+            H.record(r, data); yield r.decode("latin-1"), data, None
+
+# --------------------------------------------------------------------------
+# container
 def run_emcm(args):
     mode, src, dst = args
     t = time.time()
@@ -988,77 +1179,139 @@ def run_emcm(args):
     subprocess.run([EMCM, mode, src, dst], check=True, env=env)
     return time.time() - t
 
-def transform(corpus, tmp):
+def transform(src, tmp):
+    kind = detect_kind(src)
     S = {n: WStream() for n in STREAMS}
     C = Codec(True, S)
-    nmsg = 0
-    for path, msg in iter_corpus(corpus):
-        C.code_message(path, msg); nmsg += 1
+    H = Hasher(); nmsg = 0
+    for path, msg, env in iter_input(src, kind, H):
+        C.code_message(path, msg, env); nmsg += 1
+    meta = b""
+    if kind == KIND_DIR:
+        empty = walk_dir(src)[1]
+        for r in empty: H.add(b"\0D " + r + b"\n")
+        meta = b"\n".join(empty)
     C.finish_mid1()
     for n in STREAMS:
         with open(os.path.join(tmp, n + ".raw"), "wb") as f: f.write(S[n].b)
-    with open(os.path.join(tmp, "nmsg"), "w") as f: f.write(str(nmsg))
+    with open(os.path.join(tmp, "info"), "wb") as f:
+        f.write(struct.pack("<BI", kind, nmsg) + H.digest() + meta)
 
-def untransform(tmp, corpus):
-    nmsg = int(open(os.path.join(tmp, "nmsg")).read())
+def untransform(tmp, dst):
+    with open(os.path.join(tmp, "info"), "rb") as f: info = f.read()
+    kind, nmsg = struct.unpack("<BI", info[:5]); digest = info[5:37]; meta = info[37:]
     S = {n: RStream(open(os.path.join(tmp, n + ".raw"), "rb").read()) for n in STREAMS}
     C = Codec(False, S)
-    with open(corpus, "wb") as out:
+    H = Hasher()
+    if kind == KIND_DIR:
+        root = os.fsencode(dst)
+        if os.path.exists(root) and (not os.path.isdir(root) or os.listdir(root)):
+            raise SystemExit("emz: %s exists and is not an empty directory" % dst)
+        os.makedirs(root, exist_ok=True)
         for _ in range(nmsg):
-            path, msg = C.code_message()
-            out.write(path.encode("latin-1") + b"\n" + str(len(msg)).encode() + b"\n" + msg)
+            path, msg, _env = C.code_message()
+            rel = safe_relpath(path.encode("latin-1"))
+            full = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f: f.write(msg)
+            H.record(rel, msg)
+        for r in (meta.split(b"\n") if meta else []):
+            os.makedirs(os.path.join(root, safe_relpath(r)), exist_ok=True); H.add(b"\0D " + r + b"\n")
+    else:
+        with open(dst, "wb") as out:
+            for _ in range(nmsg):
+                path, msg, env = C.code_message()
+                if kind == KIND_CORPUS:
+                    rec = path.encode("latin-1") + b"\n" + str(len(msg)).encode() + b"\n"
+                    out.write(rec); H.add(rec)
+                elif env is not None:
+                    out.write(env); H.add(env)
+                out.write(msg); H.add(msg)
+    if H.digest() != digest:
+        raise SystemExit("emz: SHA-256 MISMATCH: the output differs from the original input")
 
-def compress(corpus, archive, jobs=2, keep=None):
+def compress(src, archive, jobs=2, keep=None):
     t0 = time.time()
     tmp = keep or tempfile.mkdtemp(prefix="emz")
     os.makedirs(tmp, exist_ok=True)
     # the transform runs in a child process so its memory is released before entropy coding
-    subprocess.run([sys.executable, os.path.abspath(__file__), "T", corpus, tmp], check=True)
+    subprocess.run([sys.executable, os.path.abspath(__file__), "T", src, tmp], check=True)
     t1 = time.time()
-    jobsl = [("c", os.path.join(tmp, n + ".raw"), os.path.join(tmp, n + ".emc")) for n in STREAMS]
+    parts = {}
+    jobsl = []
+    for n in STREAMS:
+        raw = os.path.join(tmp, n + ".raw"); size = os.path.getsize(raw)
+        k = (size + CHUNK - 1) // CHUNK
+        parts[n] = k
+        if k == 1:
+            jobsl.append(("c", raw, os.path.join(tmp, n + ".emc.0")))
+        elif k > 1:
+            with open(raw, "rb") as f:
+                for i in range(k):
+                    with open(os.path.join(tmp, "%s.raw.%d" % (n, i)), "wb") as g: g.write(f.read(CHUNK))
+                    jobsl.append(("c", os.path.join(tmp, "%s.raw.%d" % (n, i)), os.path.join(tmp, "%s.emc.%d" % (n, i))))
     jobsl.sort(key=lambda j: -os.path.getsize(j[1]))
     with ThreadPoolExecutor(jobs) as ex: list(ex.map(run_emcm, jobsl))
-    nmsg = int(open(os.path.join(tmp, "nmsg")).read())
+    with open(os.path.join(tmp, "info"), "rb") as f: info = f.read()
     with open(archive, "wb") as out:
-        out.write(MAGIC + struct.pack("<I", nmsg))
+        out.write(MAGIC + struct.pack("<I", len(info)) + info)
         for n in STREAMS:
-            data = open(os.path.join(tmp, n + ".emc"), "rb").read()
-            out.write(struct.pack("<Q", len(data))); out.write(data)
-    sizes = {n: (os.path.getsize(os.path.join(tmp, n + ".raw")), os.path.getsize(os.path.join(tmp, n + ".emc"))) for n in STREAMS}
+            out.write(struct.pack("<B", parts[n]))
+            for i in range(parts[n]):
+                data = open(os.path.join(tmp, "%s.emc.%d" % (n, i)), "rb").read()
+                out.write(struct.pack("<Q", len(data))); out.write(data)
+    sizes = {n: (os.path.getsize(os.path.join(tmp, n + ".raw")),
+                 sum(os.path.getsize(os.path.join(tmp, "%s.emc.%d" % (n, i))) for i in range(parts[n]))) for n in STREAMS}
     if not keep: shutil.rmtree(tmp)
     t2 = time.time()
-    print(f"messages {nmsg}  transform {t1 - t0:.1f}s  entropy coding {t2 - t1:.1f}s", file=sys.stderr)
+    kind, nmsg = struct.unpack("<BI", info[:5])
+    print(f"{KIND_NAMES[kind]}: messages {nmsg}  transform {t1 - t0:.1f}s  entropy coding {t2 - t1:.1f}s", file=sys.stderr)
     return sizes
 
-def decompress(archive, corpus, jobs=2):
+def decompress(archive, dst, jobs=2):
     tmp = tempfile.mkdtemp(prefix="emzd")
-    t0 = time.time()
-    with open(archive, "rb") as f:
-        if f.read(4) != MAGIC: raise SystemExit("not an emz v2 archive")
-        nmsg = struct.unpack("<I", f.read(4))[0]
-        jobsl = []
+    try:
+        t0 = time.time()
+        with open(archive, "rb") as f:
+            if f.read(4) != MAGIC: raise SystemExit("emz: not an emz archive of this version")
+            info = f.read(struct.unpack("<I", f.read(4))[0])
+            with open(os.path.join(tmp, "info"), "wb") as g: g.write(info)
+            jobsl = []; parts = {}
+            for n in STREAMS:
+                parts[n] = struct.unpack("<B", f.read(1))[0]
+                for i in range(parts[n]):
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    with open(os.path.join(tmp, "%s.emc.%d" % (n, i)), "wb") as g: g.write(f.read(ln))
+                    jobsl.append(("d", os.path.join(tmp, "%s.emc.%d" % (n, i)), os.path.join(tmp, "%s.raw.%d" % (n, i))))
+        jobsl.sort(key=lambda j: -os.path.getsize(j[1]))
+        with ThreadPoolExecutor(jobs) as ex: list(ex.map(run_emcm, jobsl))
         for n in STREAMS:
-            ln = struct.unpack("<Q", f.read(8))[0]
-            with open(os.path.join(tmp, n + ".emc"), "wb") as g: g.write(f.read(ln))
-            jobsl.append(("d", os.path.join(tmp, n + ".emc"), os.path.join(tmp, n + ".raw")))
-    with open(os.path.join(tmp, "nmsg"), "w") as g: g.write(str(nmsg))
-    jobsl.sort(key=lambda j: -os.path.getsize(j[1]))
-    with ThreadPoolExecutor(jobs) as ex: list(ex.map(run_emcm, jobsl))
-    t1 = time.time()
-    subprocess.run([sys.executable, os.path.abspath(__file__), "U", tmp, corpus], check=True)
-    shutil.rmtree(tmp)
-    print(f"entropy decoding {t1 - t0:.1f}s  inverse transform {time.time() - t1:.1f}s", file=sys.stderr)
+            with open(os.path.join(tmp, n + ".raw"), "wb") as g:
+                for i in range(parts[n]):
+                    with open(os.path.join(tmp, "%s.raw.%d" % (n, i)), "rb") as h: shutil.copyfileobj(h, g)
+        t1 = time.time()
+        subprocess.run([sys.executable, os.path.abspath(__file__), "U", tmp, dst], check=True)
+        print(f"entropy decoding {t1 - t0:.1f}s  inverse transform {time.time() - t1:.1f}s  (SHA-256 verified)",
+              file=sys.stderr)
+    finally:
+        shutil.rmtree(tmp)
 
 if __name__ == "__main__":
-    if sys.argv[1] == "T":
-        transform(sys.argv[2], sys.argv[3]); sys.exit(0)
-    if sys.argv[1] == "U":
-        untransform(sys.argv[2], sys.argv[3]); sys.exit(0)
-    if sys.argv[1] == "c":
-        sizes = compress(sys.argv[2], sys.argv[3], keep=os.environ.get("EMZ_KEEP"))
-        tot = 0
-        for n, (r, c) in sorted(sizes.items(), key=lambda x: -x[1][1]):
-            print(f"{n:10s} raw {r:>12,}  coded {c:>11,}", file=sys.stderr); tot += c
-        print(f"total coded {tot:,}  archive {os.path.getsize(sys.argv[3]):,}", file=sys.stderr)
-    else:
-        decompress(sys.argv[2], sys.argv[3])
+    if len(sys.argv) != 4 or sys.argv[1] not in ("c", "d", "T", "U"):
+        raise SystemExit(__doc__)
+    try:
+        if sys.argv[1] == "T":
+            transform(sys.argv[2], sys.argv[3])
+        elif sys.argv[1] == "U":
+            untransform(sys.argv[2], sys.argv[3])
+        elif sys.argv[1] == "c":
+            sizes = compress(sys.argv[2], sys.argv[3], keep=os.environ.get("EMZ_KEEP"))
+            tot = 0
+            for n, (r, c) in sorted(sizes.items(), key=lambda x: -x[1][1]):
+                if r: print(f"{n:10s} raw {r:>12,}  coded {c:>11,}", file=sys.stderr)
+                tot += c
+            print(f"total coded {tot:,}  archive {os.path.getsize(sys.argv[3]):,}", file=sys.stderr)
+        else:
+            decompress(sys.argv[2], sys.argv[3])
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"emz: {os.path.basename(str(e.cmd[0]))} failed (exit {e.returncode})")

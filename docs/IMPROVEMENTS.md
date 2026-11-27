@@ -8,24 +8,23 @@ tried).
 
 ## Where the bits go now
 
-| Enron, full corpus (55.80 MB) | Coded size | Share |
+| Enron, full corpus (54.47 MB) | Coded size | Share |
 |---|---:|---:|
-| Body text (after de-duplication) | 49.77 MB | 89.2% |
-| Header literals (display names, addresses, subjects) | 4.05 MB | 7.3% |
+| Body text (after de-duplication) | 48.93 MB | 89.8% |
+| Header literals (display names, addresses, subjects) | 3.94 MB | 7.2% |
 | Move-to-front ranks of header values | 0.54 MB | 1.0% |
 | Date | 0.43 MB | 0.8% |
-| Body lengths, MIME structure, body references | 0.40 MB | 0.7% |
 | Message-ID and thread references | 0.27 MB | 0.5% |
-| Message kind, copies, templates | 0.27 MB | 0.5% |
-| Path, verbatim fallback | 0.07 MB | 0.1% |
+| Message kind, copies, templates | 0.26 MB | 0.5% |
+| Path, verbatim fallback, MIME structure | 0.11 MB | 0.2% |
 
-| oss-security 2015–2026 (20.24 MB) | Coded size | Share |
+| oss-security 2015–2026 (19.92 MB) | Coded size | Share |
 |---|---:|---:|
-| Body text (including decoded QP and base64 text) | 9.04 MB | 44.7% |
-| Signature material (base64 runs in DKIM, ARC, Google, Microsoft fields) | 5.56 MB | 27.5% |
-| Binary attachments (decoded base64) | 3.32 MB | 16.4% |
-| Header literals | 2.02 MB | 10.0% |
-| Everything else | 0.30 MB | 1.5% |
+| Body text (including decoded QP and base64 text) | 8.85 MB | 44.4% |
+| Signature material (base64 runs in DKIM, ARC, Google, Microsoft fields) | 5.53 MB | 27.8% |
+| Binary attachments (decoded base64) | 3.31 MB | 16.6% |
+| Header literals | 1.98 MB | 9.9% |
+| Everything else | 0.26 MB | 1.3% |
 
 On Enron nearly everything left is first-occurrence body text. On recent mail
 almost half of the output is random by construction (signatures, encrypted
@@ -41,28 +40,54 @@ gain there.
 | Received / X-Received / signature timestamps relative to Date | part of the −11.3% above |
 | DKIM/ARC skeleton: tags and folding as move-to-front values per signer, base64 runs and timestamps split off | part of the −11.3% above |
 | DKIM/ARC body hash (bh=) recomputed from the body (55% of DKIM signatures match) | −0.7% (1,500-message sample) |
-| Fields without a model refer to other fields and to the body size and line count (Emacs VM's X-VM-v5-Data in 68% of messages; mbox Content-Length/Lines) | −2.8% (sample); X-VM-v5-Data falls from about 570 KB to 141 KB |
+| Fields without a model refer to other fields and to the body size and line count (Emacs VM's X-VM-v5-Data in 68% of messages; mbox Content-Length/Lines) | −2.8% (sample); X-VM-v5-Data falls from about 570 KB to 137 KB (current coder) |
 | Multipart boundary taken from the body's first delimiter line | −0.9% (sample) |
 | MIME segmentation with verified quoted-printable (5,394 parts; all 8 encoder variants occur) and base64 (4,249 text parts, 21.8 MB decoded, go to the body stream; 228 binary parts to their own stream) | part of the −11.3% above |
 | Copies coded as reference + bit mask of differing fields | together with the subject and generic header models: −1.4% on the Enron 100 MB subset (version 1 → version 2 transform, both with the version 2 coder; the body stream is identical) |
 | Quote-aware match model in `emcm`: predicts quoted text from the original through `> ` prefixes (item 2, "quote prefixes") | −1.84% on recent bodies, −0.46% on Enron bodies (12 MB samples) |
 | 4-way bucket search, sparse insertion for the long match model, order-2 APM (item 1, "mixer and SSE") | the three together: −0.13% on recent bodies, −0.21% on Enron bodies |
+| Run model in `emcm`: per context the last byte seen there and its repeat count, one mixer input per context | switched off on its own: +0.65% on Enron bodies, +0.83% on recent bodies (12 MB samples) |
+| Direct order-1 and order-2 inputs; third mixer selected by previous byte × partial byte; learned final mix of the APM outputs; order 5 instead of order 6 (item 1, "mixer and SSE") | switched off one at a time: +0.09/+0.18% (direct inputs), +0.29/+0.29% (third mixer), +0.23/+0.33% (final mix), +0.12/+0.08% (order 6) on Enron/recent bodies. With the run model, the coder is 1.4% (Enron bodies) and 1.8% (recent bodies) smaller than the version 2 coder as first released, at about 1.45× the time |
+| End marks instead of lengths for body text parts (item 6, "body length") | −0.63% on the Enron 100 MB subset, −0.33% on the recent sample; the length stream almost disappears and the body stream does not grow |
+| Input forms (directory trees, mbox with a `From ` line model, single messages), SHA-256 check on decompression, streams over 2 GiB split | no effect on the benchmarks; a `From ` line costs about 2 bytes on a constructed mbox |
 
-In total: recent corpus 23.05 → 20.24 MB (−12.2%); Enron 57.35 → 55.80 MB
-(−2.7%).
+In total: recent corpus 23.05 → 19.92 MB (−13.6%); Enron 57.35 → 54.47 MB
+(−5.0%).
+
+## Tried without gain
+
+* **Recompressing deflate data in attachments** (precomp style: inflate,
+  then re-deflate with zlib and check that the bytes match). In the recent
+  corpus 3.35 MB of attachments are gzip, zip, PDF or PNG, but only 168 KB of
+  their deflate streams (5%) come out identical from zlib at any level; the
+  rest were written by other deflate implementations. Reproducing those needs
+  a preflate-style diff of the deflate decisions, which is a project of its
+  own.
+* **Timestamps inside Message-IDs.** 25% of the recent Message-IDs embed the
+  send time (mutt, git send-email, Alpine), but the coder already predicts
+  most of those digits from the previous ID; the estimated saving is about
+  10 KB (0.05%).
+* **16-bit probabilities in the arithmetic coder:** −0.02% to −0.05%.
+* **More contexts** (word trigram, word + previous byte): still 0.1–0.8%
+  worse at the table size of the full corpus, also with the run model;
+  order 12 instead of order 8 was worse on Enron.
+* **Faster StateMap adaptation** (limit 255): no change. **Final mixer**
+  selected by the partial byte, or used without the fixed average: worse.
+  **First mixer** selected by how many run predictions agree: no change.
 
 ## 1. A stronger model for body text (still the largest lever)
 
-Body text is 89% of the Enron output and 45% of the recent one.
+Body text is 90% of the Enron output and 44% of the recent one.
 
 * **Measured:** on the same body stream (5 MB Enron sample), paq8px v217
   produces 17% less output than `emcm` version 1 (226,756 vs 273,494 bytes).
   Putting the emz transform in front of paq8px beats paq8px alone by 2.6%, so
   the structure gains add to a stronger coder.
 * **Measured:** on the first 1,500 messages of the recent corpus, paq8px
-  codes the body stream 14.5% smaller than `emcm` version 2 (605,619 vs
-  708,459 bytes), and the emz transform with paq8px as back end is 7.5%
-  smaller than paq8px alone (881,698 vs 952,713 bytes).
+  codes the body stream 14.5% smaller than `emcm` as first released in
+  version 2 (605,619 vs 708,459 bytes; the current coder: 697,915, so the gap
+  is now 13%), and the emz transform with paq8px as back end is 7.5% smaller
+  than paq8px alone (881,698 vs 952,713 bytes).
 * **Measured:** adding a context to `emcm` (order 5, word trigram, or word +
   last byte) *hurt* by 0.5–0.9% at the table-to-data ratio used for the full
   corpus (12 MB body sample, 64 MB table). With a 4× larger table the
@@ -107,7 +132,7 @@ From the per-line cost breakdown of the body coder (12 MB Enron sample):
 
 ## 3. Headers of recent mail
 
-What is left in the recent corpus's header literals (2.0 MB, about 119 bytes
+What is left in the recent corpus's header literals (2.0 MB, about 117 bytes
 per message; `results/oss_header_literals_by_field.txt`):
 
 * **Message-IDs (17% of header literals).** Many IDs embed a timestamp
@@ -125,7 +150,7 @@ per message; `results/oss_header_literals_by_field.txt`):
 * **X-VM-v5-Data remainder (7%).** The weekday and month names, the month
   number and a UTC sort key are all functions of the Date header, and the
   summary line truncates the sender address to 12 characters. A client-specific
-  model would remove most of the remaining 141 KB. **Estimated: −0.5%** on
+  model would remove most of the remaining 137 KB. **Estimated: −0.5%** on
   this corpus, nothing elsewhere.
 * **Signature material (27.5% of the total)** cannot be compressed: RSA
   signatures, encrypted anti-spam reports and random tokens. The only lever
@@ -157,9 +182,8 @@ that update the contexts but are not coded) would allow:
 
 ## 6. Small numeric streams (Enron, about 2% of the output)
 
-* **Body length:** an end-of-body symbol coded inside the body stream, where
-  the model can predict it from the text (signatures, disclaimers), instead
-  of a separate length.
+* **Body length:** done; body text parts now end with a mark in the text
+  stream (see above).
 * **Date:** a reply is later than the message it quotes; copies in the
   sender's and recipients' mailboxes share dates; the date inside a reply
   block is the parent's date.

@@ -1,4 +1,4 @@
-entropy decoding 1500.0s  inverse transform 128.8s
+entropy decoding 2048.2s  inverse transform 123.3s  (SHA-256 verified)
 decompress exit 0
 5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc  enron.dec
 5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc  enron.corpus
