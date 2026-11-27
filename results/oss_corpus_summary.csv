@@ -1,0 +1,14 @@
+compressor,compressed_bytes,ratio,bits_per_byte,compress_wall_s,compress_cpu_s,compress_peak_MB,decompress_wall_s,decompress_peak_MB,roundtrip_sha256_ok
+gzip-9,42759525,3.09,2.5892,5,5,3,1,3,True
+bzip2-9,36988911,3.57,2.2398,14,14,8,6,5,True
+zstd-19,28497574,4.64,1.7256,67,66,218,0,12,True
+lrzip-lzma,28020795,4.71,1.6967,27,44,424,2,97,True
+zstd-22-long31,27442755,4.81,1.6617,109,108,805,0,130,True
+xz-9e,26643972,4.96,1.6134,95,93,675,2,66,True
+bsc-b512-e2,26568956,4.97,1.6088,6,11,495,4,488,True
+brotli-11-w24,26456098,4.99,1.6020,285,282,221,0,19,True
+lrzip-zpaq,25796260,5.12,1.5620,54,79,396,56,306,True
+ppmd-o16-1g,25717644,5.14,1.5573,29,29,1031,31,1030,True
+zpaq-m5,23741815,5.56,1.4376,222,361,1688,303,1759,True
+emz version 1,23049388,5.73,1.3957,,,,,,True
+emz,19924181,6.63,1.2065,322,427,902,330,902,True

@@ -14,11 +14,17 @@
  * and decompression (emz uses the defaults): EMCM_LR, EMCM_LRF, EMCM_CTX,
  * EMCM_DISC, EMCM_TB.
  *
- * Model: nibble-bucketed hashed contexts (orders 1-4,6,8, word unigram and
+ * Model: nibble-bucketed hashed contexts (orders 1-5,8, word unigram and
  * bigram, column/"byte above"), bit-history state machines mapped to
- * probabilities by adaptive StateMaps, two match models (short and long
- * minimum length) over the whole stream history, three gated logistic mixers
- * combined by a final mixer, and three APM/SSE refinement stages.
+ * probabilities by adaptive StateMaps, a run model per context (last byte
+ * seen and its repeat count), direct order-1/2 inputs, two match models
+ * (short and long minimum length) over the whole stream history plus a
+ * quote-aware one, three gated logistic mixers combined by a final mixer,
+ * four APM/SSE stages, and a learned mixer that combines the APM outputs.
+ * EMCM_QM, EMCM_SPARSE, EMCM_APM2, EMCM_RUN, EMCM_DIRECT, EMCM_M3SEL and
+ * EMCM_FMIX (=0) and EMCM_WAYS (=2) switch single components off for ablations;
+ * with all off and EMCM_CTX=0,1,2,3,4,5,6,7,8 the model is version 1's
+ * (apart from the order in which the mixers add up their inputs).
  */
 /* The model uses float arithmetic in its mixers.  Archives are portable only
  * if every build rounds identically, so fused multiply-add contraction must be
@@ -33,6 +39,8 @@
 #include <math.h>
 
 typedef uint8_t U8; typedef uint16_t U16; typedef uint32_t U32; typedef uint64_t U64;
+static int opt_qm = 1, opt_ways = 4, opt_sparse = 3, opt_apm2 = 1;   /* v2 model options */
+static int opt_run = 1, opt_direct = 1, opt_m3sel = 1, opt_fmix = 1;
 
 /* ---------- logistic helpers ---------- */
 static int squash(int d) {
@@ -160,17 +168,24 @@ static inline void apm_update(APM *a, int y, int rate) {
 
 /* ---------- Mixer (float, gated by a selector context) ---------- */
 typedef struct { int n, nsel; float *w; float *x; int sel; float lr; int pr; } Mixer;
+/* Inputs and weights are padded to a multiple of 8 with zero inputs, and the
+ * dot product keeps 8 partial sums that are added in a fixed order, so the
+ * result does not depend on how the compiler vectorizes the loop. */
 static void mx_init(Mixer *m, int n, int nsel, float lr, float w0) {
+  n = (n + 7) & ~7;
   m->n = n; m->nsel = nsel; m->lr = lr; m->sel = 0; m->pr = 2048;
-  m->w = (float *)malloc(sizeof(float) * n * nsel);
-  m->x = (float *)calloc(n, sizeof(float));
-  for (int i = 0; i < n * nsel; i++) m->w[i] = w0;
+  if (posix_memalign((void **)&m->w, 64, sizeof(float) * (size_t)n * nsel) ||
+      posix_memalign((void **)&m->x, 64, sizeof(float) * (size_t)n)) { fprintf(stderr, "oom\n"); exit(1); }
+  memset(m->x, 0, sizeof(float) * (size_t)n);
+  for (size_t i = 0; i < (size_t)n * nsel; i++) m->w[i] = w0;
 }
 static inline int mx_p(Mixer *m, int sel) {
   m->sel = sel;
-  const float *w = m->w + (size_t)sel * m->n;
-  float dot = 0;
-  for (int i = 0; i < m->n; i++) dot += w[i] * m->x[i];
+  const float *w = m->w + (size_t)sel * m->n, *x = m->x;
+  float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int i = 0; i < m->n; i += 8)
+    for (int j = 0; j < 8; j++) s[j] += w[i + j] * x[i + j];
+  float dot = ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
   int d = (int)(dot * 256.0f);
   if (d > 2047) d = 2047; if (d < -2047) d = -2047;
   return m->pr = squash(d);
@@ -195,9 +210,11 @@ static inline U8 *ht_get(HashTable *h, U32 i) {
   if (t[b] == chk) return t + b;
   if (t[b ^ 16] == chk) return t + (b ^ 16);
   if (t[b ^ 32] == chk) return t + (b ^ 32);
+  if (opt_ways == 4 && t[b ^ 48] == chk) return t + (b ^ 48);
   U32 r = b;
   if (t[r + 1] > t[(b ^ 16) + 1]) r = b ^ 16;
   if (t[r + 1] > t[(b ^ 32) + 1]) r = b ^ 32;
+  if (opt_ways == 4 && t[r + 1] > t[(b ^ 48) + 1]) r = b ^ 48;
   memset(t + r, 0, 16); t[r] = chk;
   return t + r;
 }
@@ -205,19 +222,20 @@ static inline U8 *ht_get(HashTable *h, U32 i) {
 /* ---------- match model ---------- */
 typedef struct {
   U32 *ht; U32 hmask; int minlen, shift; U32 h, ptr, len; StateMap sm; int eb; /* expected bit or -1 */
+  U32 sparse;   /* insert only positions with (pos & sparse) == 0; lookups at every position */
 } Match;
 #define MAXLEN 65000
 static void mm_init(Match *m, int bits, int minlen) {
   m->ht = (U32 *)calloc((size_t)1 << bits, sizeof(U32)); m->hmask = (1u << bits) - 1;
   m->minlen = minlen; m->shift = (bits + minlen - 1) / minlen; if (m->shift < 1) m->shift = 1;
-  m->h = 0; m->ptr = 0; m->len = 0; m->eb = -1;
+  m->h = 0; m->ptr = 0; m->len = 0; m->eb = -1; m->sparse = 0;
   sm_init(&m->sm, 64 * 2, 0);
 }
 static inline int lenbucket(U32 len) { return len < 16 ? (int)len : (len < 32 ? 16 + ((len - 16) >> 2) : (len < 64 ? 20 + ((len - 32) >> 3) : (len < 512 ? 24 + ((len - 64) >> 6) : 31))); }
 
 /* ---------- predictor ---------- */
 #define NCTX 16
-static int nctx = 9; static int ctxsel[NCTX] = {0,1,2,3,4,5,6,7,8};
+static int nctx = 9; static int ctxsel[NCTX] = {0,1,2,3,9,5,6,7,8};   /* orders 1-5, 8, word, bigram, column */
 typedef struct {
   U8 *buf; U32 pos, cap;          /* history */
   HashTable T;
@@ -227,8 +245,16 @@ typedef struct {
   U32 hctx[NCTX];
   Match mm[2];
   StateMap mmsm2;                 /* combined match agreement */
-  Mixer m1, m2, m3, mf;
-  APM a1, a2, a3;
+  /* quote-aware match model: a second history with e-mail quote prefixes
+   * ("> ", ">>", "> > ") removed, so quoted text keeps matching the
+   * original across line starts */
+  U8 *nbuf; U32 npos; int qstate; Match qm;
+  Mixer m1, m2, m3, mf, fx;       /* fx: learned combination of mixer and APM outputs */
+  APM a1, a2, a3, a4;
+  StateMap o1sm, o2sm;             /* direct (unhashed) order-1 and order-2 bit probabilities */
+  /* run model: per context the last byte seen and how often it repeated,
+   * in a table of 32-bit slots (8-bit check | byte | count) */
+  U32 *rt; U32 rmask; U32 *rslot[NCTX]; int rbyte[NCTX], rcnt[NCTX], rcx[NCTX]; StateMap rsm;
   U32 c0, c4, c8, c12, bitpos, nib;    /* partial byte with leading 1, last bytes */
   U32 word0, word1, word2, col, linestart, prevlinestart;
   int pr, pmix;
@@ -241,17 +267,29 @@ static void pred_init(Pred *P, U32 cap, int tbits, int mbits, U8 *ext) {
   for (int i = 0; i < nctx; i++) sm_init(&P->sm[i], 256, 1);
   mm_init(&P->mm[0], mbits, 6);
   mm_init(&P->mm[1], mbits, 24);
+  P->mm[1].sparse = (U32)opt_sparse;
+  P->nbuf = (U8 *)calloc(P->cap, 1); P->npos = 0; P->qstate = 0;
+  mm_init(&P->qm, mbits, 12);
   sm_init(&P->mmsm2, 4096, 0);
-  int nin = 2 * nctx + 3 + 1;
+  int nin = 2 * nctx + 3 + 1 + 1 + (opt_direct ? 2 : 0) + (opt_run ? nctx : 0);
   float lr = getenv("EMCM_LR") ? (float)atof(getenv("EMCM_LR")) : 0.0035f;
   float lrf = getenv("EMCM_LRF") ? (float)atof(getenv("EMCM_LRF")) : 0.0015f;
   mx_init(&P->m1, nin, 256, lr, 0.25f);
-  mx_init(&P->m2, nin, 320, lr, 0.25f);
-  mx_init(&P->m3, nin, 256 * 8, lr, 0.25f);
+  mx_init(&P->m2, nin, 640, lr, 0.25f);
+  mx_init(&P->m3, nin, opt_m3sel ? 256 * 256 : 256 * 8, lr, 0.25f);
   mx_init(&P->mf, 4, 256, lrf, 0.33f);
+  if (opt_fmix) mx_init(&P->fx, 6, 4, 0.0008f, 0.2f);
+  if (opt_direct) { sm_init(&P->o1sm, 1 << 16, 0); sm_init(&P->o2sm, 1 << 22, 0); }
+  if (opt_run) {
+    int rb = tbits - 3; if (rb < 10) rb = 10;
+    P->rt = (U32 *)calloc((size_t)1 << rb, 4); P->rmask = (1u << rb) - 1;
+    sm_init(&P->rsm, NCTX * 64, 0);
+    for (int i = 0; i < nctx; i++) { P->rslot[i] = P->rt; P->rbyte[i] = -1; P->rcnt[i] = 0; P->rcx[i] = -1; }
+  }
   apm_init(&P->a1, 256);
   apm_init(&P->a2, 65536);
   apm_init(&P->a3, 65536);
+  apm_init(&P->a4, 65536);
   P->c0 = 1; P->pr = 2048;
   for (int i = 0; i < nctx; i++) { P->bucket[i] = ht_get(&P->T, hash2(i, 0)); P->cp[i] = P->bucket[i] + 1; }
 }
@@ -267,6 +305,34 @@ static inline int mm_predict(Pred *P, Match *m) {
   return stretch(sm_p(&m->sm, cx));
 }
 
+static inline int qm_predict(Pred *P) {
+  Match *m = &P->qm;
+  m->eb = -1;
+  if (opt_qm && m->len > 0) {
+    U32 pb = P->nbuf[m->ptr] | 0x100;
+    if ((pb >> (8 - P->bitpos)) == P->c0) m->eb = (pb >> (7 - P->bitpos)) & 1;
+  }
+  int cx = m->eb < 0 ? 0 : (lenbucket(m->len) * 2 + m->eb) * 2 + (P->qstate != 3);
+  return stretch(sm_p(&m->sm, cx));
+}
+
+static void qm_byte(Pred *P, U32 c) {
+  Match *m = &P->qm;
+  P->nbuf[P->npos++] = (U8)c;
+  m->h = (m->h * (1u << m->shift) + c + 1) & m->hmask;
+  if (m->len > 0 && P->nbuf[m->ptr] == c) { m->len++; m->ptr++; if (m->len > MAXLEN) m->len = MAXLEN; }
+  else m->len = 0;
+  if (m->len == 0 && P->npos >= (U32)m->minlen) {
+    U32 p = m->ht[m->h];
+    if (p > 0 && p < P->npos) {
+      U32 l = 0;
+      while (l < MAXLEN && l < p && P->nbuf[p - l - 1] == P->nbuf[P->npos - l - 1]) l++;
+      if (l >= (U32)m->minlen) { m->len = l; m->ptr = p; }
+    }
+  }
+  m->ht[m->h] = P->npos;
+}
+
 static void mm_byte(Pred *P, Match *m) {
   U32 c = P->buf[P->pos - 1];
   m->h = (m->h * (1u << m->shift) + c + 1) & m->hmask;
@@ -280,7 +346,7 @@ static void mm_byte(Pred *P, Match *m) {
       if (l >= (U32)m->minlen) { m->len = l; m->ptr = p; }
     }
   }
-  m->ht[m->h] = P->pos;
+  if ((P->pos & m->sparse) == 0) m->ht[m->h] = P->pos;
 }
 
 static int pred_p(Pred *P) {
@@ -295,19 +361,34 @@ static int pred_p(Pred *P) {
   }
   int s0 = mm_predict(P, &P->mm[0]);
   int s1 = mm_predict(P, &P->mm[1]);
+  int sq = qm_predict(P);
   x1[k++] = s0 * (1.0f / 256.0f);
   x1[k++] = s1 * (1.0f / 256.0f);
+  x1[k++] = opt_qm ? sq * (1.0f / 256.0f) : 0.0f;
   /* agreement of the two match models */
   int e0 = P->mm[0].eb, e1 = P->mm[1].eb;
   U32 acx = (U32)((e0 + 1) * 3 + (e1 + 1)) * 32 + (U32)(lenbucket(P->mm[0].len > P->mm[1].len ? P->mm[0].len : P->mm[1].len));
   x1[k++] = stretch(sm_p(&P->mmsm2, acx * 8 + P->bitpos)) * (1.0f / 256.0f);
+  if (opt_run)
+    for (int i = 0; i < nctx; i++) {
+      int rb = P->rbyte[i];
+      if (rb >= 0 && (U32)((rb | 0x100) >> (8 - P->bitpos)) == P->c0) {
+        int eb = (rb >> (7 - P->bitpos)) & 1, cn = P->rcnt[i] > 31 ? 31 : P->rcnt[i];
+        P->rcx[i] = i * 64 + cn * 2 + eb;
+        x1[k++] = stretch(P->rsm.t[P->rcx[i]] >> 20) * (1.0f / 256.0f);
+      } else { P->rcx[i] = -1; x1[k++] = 0.0f; }
+    }
+  if (opt_direct) {
+    x1[k++] = stretch(sm_p(&P->o1sm, ((P->c4 & 0xff) << 8) | P->c0)) * (1.0f / 256.0f);
+    x1[k++] = stretch(sm_p(&P->o2sm, (((P->c4 & 0xffff) << 8) | P->c0) & 0x3fffff)) * (1.0f / 256.0f);
+  }
   x1[k++] = 0.5f; /* bias */
   memcpy(P->m2.x, x1, sizeof(float) * k);
   memcpy(P->m3.x, x1, sizeof(float) * k);
   int lb = lenbucket(P->mm[0].len); if (lb > 15) lb = 15;
   int p1 = mx_p(&P->m1, P->c0);
-  int p2 = mx_p(&P->m2, (nseen * 16 + lb) * 2 + (P->mm[1].len > 0));
-  int p3 = mx_p(&P->m3, (P->c4 & 0xff) * 8 + P->bitpos);
+  int p2 = mx_p(&P->m2, ((nseen * 16 + lb) * 2 + (P->mm[1].len > 0)) * 2 + (P->qm.eb >= 0));
+  int p3 = mx_p(&P->m3, opt_m3sel ? (P->c4 & 0xff) * 256 + P->c0 : (P->c4 & 0xff) * 8 + P->bitpos);
   P->mf.x[0] = stretch(p1) / 256.0f; P->mf.x[1] = stretch(p2) / 256.0f; P->mf.x[2] = stretch(p3) / 256.0f; P->mf.x[3] = 0.5f;
   int pm = mx_p(&P->mf, P->c0);
   P->pmix = pm;
@@ -315,7 +396,18 @@ static int pred_p(Pred *P) {
   int q2 = apm_p(&P->a2, pm, (P->c0 | ((P->c4 & 0xff) << 8)) & 0xffff);
   U32 mctx = P->mm[0].eb < 0 ? P->c0 : (P->c0 | ((U32)(P->buf[P->mm[0].ptr]) << 8)) ^ ((U32)(lb > 7) << 15);
   int q3 = apm_p(&P->a3, pm, hash2(mctx, P->mm[0].eb < 0) & 0xffff);
-  int p = (2 * pm + q1 + 2 * q2 + 3 * q3 + 4) >> 3;
+  int p;
+  if (opt_apm2) {
+    int q4 = apm_p(&P->a4, pm, hash2(P->c0, P->c4 & 0xffff) & 0xffff);
+    p = (2 * pm + q1 + q2 + q4 + 3 * q3 + 4) >> 3;
+    if (opt_fmix) {
+      /* learned weights for the same predictions, averaged with the fixed ones */
+      float *fx = P->fx.x;
+      fx[0] = stretch(pm) / 256.0f; fx[1] = stretch(q1) / 256.0f; fx[2] = stretch(q2) / 256.0f;
+      fx[3] = stretch(q3) / 256.0f; fx[4] = stretch(q4) / 256.0f; fx[5] = 0.5f;
+      p = (p + mx_p(&P->fx, (P->mm[0].eb >= 0) * 2 + (P->mm[1].eb >= 0)) + 1) >> 1;
+    }
+  } else p = (2 * pm + q1 + 2 * q2 + 3 * q3 + 4) >> 3;
   if (p < 1) p = 1; if (p > 4095) p = 4095;
   return P->pr = p;
 }
@@ -327,9 +419,15 @@ static void pred_update(Pred *P, int y) {
   }
   sm_update(&P->mm[0].sm, y, 1023);
   sm_update(&P->mm[1].sm, y, 1023);
+  sm_update(&P->qm.sm, y, 1023);
   sm_update(&P->mmsm2, y, 1023);
   mx_update(&P->m1, y); mx_update(&P->m2, y); mx_update(&P->m3, y); mx_update(&P->mf, y);
+  if (opt_fmix && opt_apm2) mx_update(&P->fx, y);
+  if (opt_direct) { sm_update(&P->o1sm, y, 1023); sm_update(&P->o2sm, y, 1023); }
+  if (opt_run)
+    for (int i = 0; i < nctx; i++) if (P->rcx[i] >= 0) { P->rsm.cx = (U32)P->rcx[i]; sm_update(&P->rsm, y, 1023); }
   apm_update(&P->a1, y, 7); apm_update(&P->a2, y, 7); apm_update(&P->a3, y, 7);
+  if (opt_apm2) apm_update(&P->a4, y, 7);
 
   P->c0 = (P->c0 << 1) | y; P->bitpos++;
   if (P->bitpos == 8) {
@@ -364,9 +462,34 @@ static void pred_update(Pred *P, int y) {
     H[11] = hash2(hash2(hash2(13, c4), c8), P->c12);
     H[12] = hash2(hash2(14, c4 & 0xffff00), 0);            /* sparse: bytes 2-3 */
     H[13] = hash2(hash2(15, P->word0), c4 & 0xff);          /* word + last byte */
+    if (opt_run)   /* record c in the run slots of the contexts that predicted it */
+      for (int i = 0; i < nctx; i++) {
+        U32 *sl = P->rslot[i], v = *sl, chk = (P->hctx[i] >> 24) | 1;
+        if (P->rbyte[i] >= 0 && (v & 0xff) == chk && ((v >> 8) & 0xff) == (U32)P->rbyte[i] && (U32)P->rbyte[i] == c) {
+          U32 cnt = (v >> 16) & 0xff; if (cnt < 255) cnt++;
+          *sl = (v & 0xffff) | (cnt << 16);
+        } else *sl = chk | (c << 8) | (1u << 16);
+      }
     for (int i = 0; i < nctx; i++) P->hctx[i] = H[ctxsel[i]];
+    if (opt_run)
+      for (int i = 0; i < nctx; i++) {
+        U32 *sl = &P->rt[hash2(P->hctx[i], 77) & P->rmask], v = *sl;
+        P->rslot[i] = sl;
+        if ((v & 0xff) == ((P->hctx[i] >> 24) | 1)) { P->rbyte[i] = (int)((v >> 8) & 0xff); P->rcnt[i] = (int)((v >> 16) & 0xff); }
+        else { P->rbyte[i] = -1; P->rcnt[i] = 0; }
+      }
     mm_byte(P, &P->mm[0]);
     mm_byte(P, &P->mm[1]);
+    if (opt_qm) {
+      /* quote prefix at line start: '>' optionally followed by one space, repeated */
+      int content = 1;
+      switch (P->qstate) {
+        case 0: if (c == '>') { content = 0; P->qstate = 1; } break;
+        case 1: if (c == '>') content = 0; else if (c == ' ') { content = 0; P->qstate = 2; } break;
+        case 2: if (c == '>') { content = 0; P->qstate = 1; } break;
+      }
+      if (content) { P->qstate = c == '\n' ? 0 : 3; qm_byte(P, c); }
+    }
     for (int i = 0; i < nctx; i++) { P->bucket[i] = ht_get(&P->T, P->hctx[i]); P->cp[i] = P->bucket[i] + 1; }
   } else if (P->bitpos == 4) {
     for (int i = 0; i < nctx; i++) { P->bucket[i] = ht_get(&P->T, hash2(P->hctx[i], P->c0)); P->cp[i] = P->bucket[i] + 1; }
@@ -413,17 +536,27 @@ static U8 *read_file(const char *fn, size_t *n) {
 int main(int argc, char **argv) {
   if (argc < 4) { fprintf(stderr, "usage: emcm c|d in out\n"); return 1; }
   if (getenv("EMCM_DISC")) disc_mode = atoi(getenv("EMCM_DISC"));
+  if (getenv("EMCM_QM")) opt_qm = atoi(getenv("EMCM_QM"));
+  if (getenv("EMCM_WAYS")) opt_ways = atoi(getenv("EMCM_WAYS"));
+  if (getenv("EMCM_SPARSE")) opt_sparse = atoi(getenv("EMCM_SPARSE"));
+  if (getenv("EMCM_APM2")) opt_apm2 = atoi(getenv("EMCM_APM2"));
+  if (getenv("EMCM_RUN")) opt_run = atoi(getenv("EMCM_RUN"));
+  if (getenv("EMCM_DIRECT")) opt_direct = atoi(getenv("EMCM_DIRECT"));
+  if (getenv("EMCM_M3SEL")) opt_m3sel = atoi(getenv("EMCM_M3SEL"));
+  if (getenv("EMCM_FMIX")) opt_fmix = atoi(getenv("EMCM_FMIX"));
   init_stretch(); init_states();
   if (getenv("EMCM_VERBOSE")) fprintf(stderr, "states %d\n", nstates);
   if (getenv("EMCM_CTX")) { nctx = 0; for (char *q = getenv("EMCM_CTX"); *q; ) { ctxsel[nctx++] = (int)strtol(q, &q, 10); if (*q == ',') q++; } }
   for (int i = 0; i < 1024; i++) dt[i] = 16384 / (i + i + 3);
   size_t n; U8 *in = read_file(argv[2], &n);
+  if (n > 0xFFFFFF00u) { fprintf(stderr, "emcm: input too large (positions are 32-bit; split it)\n"); return 1; }
   FILE *fo = fopen(argv[3], "wb"); if (!fo) { perror(argv[3]); return 1; }
   if (argv[1][0] == 'c') {
     int tbits = ilog2u(n + 1) + (getenv("EMCM_TB") ? atoi(getenv("EMCM_TB")) : -2); int tbmax = getenv("EMCM_TBMAX") ? atoi(getenv("EMCM_TBMAX")) : 26;
     if (tbits < 12) tbits = 12; if (tbits > tbmax) tbits = tbmax;
-    int mbits = ilog2u(n + 1); if (mbits < 12) mbits = 12; if (mbits > 24) mbits = 24;
-    U8 hdr[14] = {'E', 'M', 'C', '1'};
+    int mbmax = getenv("EMCM_MBMAX") ? atoi(getenv("EMCM_MBMAX")) : 24;
+    int mbits = ilog2u(n + 1); if (mbits < 12) mbits = 12; if (mbits > mbmax) mbits = mbmax;
+    U8 hdr[14] = {'E', 'M', 'C', '3'};
     for (int i = 0; i < 8; i++) hdr[4 + i] = (U8)((U64)n >> (8 * i));
     hdr[12] = (U8)tbits; hdr[13] = (U8)mbits;
     fwrite(hdr, 1, 14, fo);
@@ -453,7 +586,7 @@ int main(int argc, char **argv) {
       fwrite(a.buf, 1, a.pos, fo);
     }
   } else {
-    if (n < 14 || memcmp(in, "EMC1", 4)) { fprintf(stderr, "bad stream\n"); return 1; }
+    if (n < 14 || memcmp(in, "EMC3", 4)) { fprintf(stderr, "bad stream\n"); return 1; }
     U64 len = 0; for (int i = 0; i < 8; i++) len |= (U64)in[4 + i] << (8 * i);
     int tbits = in[12], mbits = in[13];
     if (len) {

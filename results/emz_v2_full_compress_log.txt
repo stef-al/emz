@@ -1,0 +1,24 @@
+corpus file: messages 517401  transform 212.0s  entropy coding 1734.8s
+body       raw  467,797,909  coded  48,933,458
+hdr_l      raw   49,154,416  coded   3,935,710
+date       raw      404,882  coded     329,158
+xal_r      raw    2,284,946  coded     253,261
+mid2       raw      549,318  coded     226,586
+dupref     raw      363,366  coded     177,187
+addr_r     raw      625,103  coded     126,834
+subj_r     raw      770,871  coded     121,587
+dsec       raw      256,957  coded      93,731
+path       raw      622,764  coded      46,628
+mid1       raw      546,055  coded      41,469
+diff       raw      587,083  coded      38,023
+hdr_r      raw    2,161,895  coded      34,218
+tmpl_r     raw      257,019  coded      28,732
+raw        raw      184,012  coded      25,102
+bodyref    raw      270,755  coded      21,123
+kind       raw      517,401  coded      20,105
+seg        raw      507,669  coded      13,808
+dfmt_r     raw      256,687  coded       3,174
+tmpl_l     raw          147  coded         130
+bin        raw            2  coded          22
+total coded 54,470,046  archive 54,470,287
+compress exit 0

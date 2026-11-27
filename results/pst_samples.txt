@@ -1,0 +1,85 @@
+Outlook PST / OST samples: emz with PST/OST support (emz_pst.py) against the
+previous emz (file coded by emcm as an opaque message), xz and zstd.  Every
+emz archive was decompressed and compared with cmp (and emz's SHA-256 check).
+
+Files (not redistributed here), from pst-extractor (MIT) src/__tests__/testdata:
+  enron.pst                         13,984,768  Unicode PST (format 23), permute encoding,
+                                                2,274 blocks, 125 nodes
+  mtnman1965@outlook.com.ost        16,818,176  OST 2013+ (format 36, 4 KB pages), no encoding,
+                                                641 of 1,218 blocks deflate-compressed by Outlook
+  pstextractortest@outlook.com.ost  16,818,176  OST 2013+, 888 of 1,469 blocks compressed
+enron_noatt.pst: enron.pst with the data of every attachment value
+(PidTagAttachDataBinary, 1,476 blocks, 11,835,742 bytes) set to zero, blocks
+re-encoded and trailers recomputed by scripts/zero_attachments.py; the file
+stays a valid store.
+
+  file                          size         emz  emz before      xz -9e   zstd -19L
+  enron.pst                 13984768    10482836    10642857    10979820    10947595
+  enron_noatt.pst           13984768      144287      177030      170156      189166
+  mtnman.ost                16818176     2512366     2527620     2516708     2520323
+  pstextractortest.ost      16818176     1538828     1559074     1535532     1552372
+
+(zstd: -19 --long=27)
+
+emz streams, enron.pst:
+  bin        raw   11,740,947  coded  10,341,713
+  pst_skel   raw    1,467,375  coded      59,574
+  msg_bin    raw      112,080  coded      25,695
+  body       raw      112,784  coded      23,682
+  msg_str    raw       30,860  coded      11,104
+  hdr_l      raw       29,753  coded       9,270
+  pst_hn     raw       47,731  coded       5,910
+  msg_r      raw        8,625  coded       2,243
+  msg_skel   raw       29,357  coded       1,818
+  tmpl_r     raw          817  coded         366
+  tmpl_l     raw          470  coded         344
+  sig_l      raw          702  coded         303
+  hdr_r      raw          835  coded         202
+  total coded 10,482,561  archive 10,482,836
+  entropy decoding 62.4s  inverse transform 0.3s  (SHA-256 verified)
+
+emz streams, enron_noatt.pst:
+  pst_skel   raw    1,467,375  coded      59,574
+  msg_bin    raw      109,792  coded      24,736
+  body       raw      112,784  coded      23,682
+  msg_str    raw       30,687  coded      11,066
+  hdr_l      raw       29,753  coded       9,270
+  bin        raw   11,608,208  coded       5,976
+  pst_hn     raw       47,731  coded       5,910
+  msg_r      raw        8,530  coded       2,248
+  tmpl_r     raw          817  coded         366
+  tmpl_l     raw          470  coded         344
+  sig_l      raw          702  coded         303
+  hdr_r      raw          835  coded         202
+  total coded 144,020  archive 144,287
+  entropy decoding 27.0s  inverse transform 0.2s  (SHA-256 verified)
+
+emz streams, mtnman.ost:
+  pst_skel   raw   16,790,189  coded   2,512,207
+  total coded 2,512,259  archive 2,512,366
+  entropy decoding 59.9s  inverse transform 0.1s  (SHA-256 verified)
+
+emz streams, pstextractortest.ost:
+  pst_skel   raw   16,784,415  coded   1,538,662
+  total coded 1,538,721  archive 1,538,828
+  entropy decoding 43.5s  inverse transform 0.2s  (SHA-256 verified)
+
+Mode: a store in which data blocks that can be decoded make up less than 10%
+of the file (both OSTs: 0.7% and 2.8%) keeps every block in place in the
+skeleton; there the property models lost 0.4% to the coder finding blocks
+next to their older copies in free space.  Both modes were measured:
+  mtnman.ost            blocks modelled 2,523,706   kept in place 2,512,430
+  pstextractortest.ost  blocks modelled 1,544,451   kept in place 1,538,811
+
+Outlook's deflate: 40 compressed OST blocks were recompressed with zlib at
+every level 0-9, window 9-15 bits, memLevel 7-9 and strategies 0-3; no setting
+reproduces any of them, and the output differs from the third or fourth byte
+on.  In size it matches zlib -9 (all 641 blocks of mtnman.ost: 866,625 bytes
+against 865,001; per block -6.9% to +0.8%), so it is another deflate
+implementation of similar strength.
+
+Tried and dropped: decoding the permute encoding in free space (52,405 ->
+52,946 bytes coded, per-64-byte choice 54,377); block IDs and offsets of
+block B-tree leaves as differences (-0.3% on enron_noatt.pst, +0.07% on an
+OST because old copies of the pages in free space stop matching); free space
+as zero runs instead of raw bytes (+0.3% to +1.3%: it cuts up UTF-16 text).

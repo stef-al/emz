@@ -1,0 +1,143 @@
+Outlook .msg samples: emz with .msg support (emz_msg.py) against the previous
+emz, xz and zstd.  Every emz archive was decompressed and compared (diff -r,
+and emz's own SHA-256 check).
+
+Sample set: 25 files, 8,540,160 bytes, not redistributed here:
+  15 files from MSGReader (MIT), MsgReaderTests/SampleFiles,
+     commit 1d452372d4ab2bfd9d9e37fbc1cb376606582c1c
+  10 files from msg-extractor (GPL-3.0), example-msg-files (incl. export-results/),
+     commit 8ec3af862980c34d1387f546aa2488eb4b044c93
+Directory layout as in those repositories (msgs/, msgs/extractor/, msgs/extractor/export/).
+
+      272896  msgs/EmailWith2Attachments.msg
+      105984  msgs/EmailWithAttachments.msg
+      130048  msgs/EmailWithInnerMailAndAttachments.msg
+      117760  msgs/EmailWithMsgAttachment.msg
+       68096  msgs/EmailWithReactions.msg
+       59392  msgs/EmailWithSpecialCharsInSubject.msg
+       56832  msgs/EmailWithSpecialCharsInSubject_2.msg
+       77312  msgs/HtmlSampleEmail.msg
+      209408  msgs/HtmlSampleEmailWithAttachment.msg
+       64000  msgs/RtfSampleEmail.msg
+      211456  msgs/RtfSampleEmailWithAttachment.msg
+       19968  msgs/RtfWithShortRussianString.msg
+       59904  msgs/TxtSampleEmail.msg
+      206336  msgs/TxtSampleEmailWithAttachment.msg
+       30720  msgs/extractor/export/strangeDate.msg
+     2044928  msgs/extractor/export/unicode.msg
+       12800  msgs/extractor/multi-stream.msg
+       70144  msgs/extractor/multi-to-to.msg
+       70144  msgs/extractor/multi-to.msg
+      358912  msgs/extractor/signed.msg
+       31744  msgs/extractor/strangeDate.msg
+     2070528  msgs/extractor/test-embedded.msg
+       86016  msgs/extractor/unicode-header.msg
+     2045952  msgs/extractor/unicode.msg
+       58880  msgs/sender_not_found_from_exchange.msg
+
+"Attachment bytes zeroed": every __substg1.0_3701* stream (attachment data,
+7,109,827 bytes) overwritten with zeros in place by scripts/zero_attachments.py;
+the files stay valid .msg.
+
+                                     as they are   attachments zeroed
+  emz (this version)                      2595994            97117
+  emz before .msg support                 2691840           186153
+  xz -9e (tar)                            2726152           181148
+  zstd -19 --long=27 (tar)                2742258           196251
+  tar                                     8560640          8560640
+
+emz streams, files as they are (python3 emz.py c msgs msgs.emz):
+  bin        raw    2,715,502  coded   2,500,414
+  body       raw      524,634  coded      23,589
+  msg_bin    raw       71,805  coded      20,763
+  msg_str    raw       65,033  coded      15,895
+  msg_skel   raw      137,535  coded      11,123
+  sig_l      raw       10,630  coded       8,220
+  msg_prop   raw       57,824  coded       6,419
+  hdr_l      raw       20,074  coded       5,732
+  msg_r      raw        3,406  coded       1,084
+  tmpl_l     raw        2,729  coded         924
+  msg_rtf    raw       56,311  coded         581
+  path       raw          722  coded         245
+  tmpl_r     raw          474  coded         193
+  hdr_r      raw          200  coded          63
+  date       raw           39  coded          56
+  sig_r      raw          554  coded          52
+  seg        raw           21  coded          39
+  kind       raw           45  coded          38
+  dsec       raw           14  coded          37
+  addr_r     raw           48  coded          33
+  rdate      raw           45  coded          29
+  subj_r     raw           51  coded          28
+  dfmt_r     raw           21  coded          26
+  bodyref    raw           18  coded          26
+  id_r       raw           12  coded          22
+  mid2       raw           14  coded          22
+  dupref     raw            2  coded          20
+  diff       raw            6  coded          18
+  total coded 2,595,691  archive 2,595,994
+
+emz streams, attachments zeroed:
+  body       raw      521,770  coded      23,874
+  msg_bin    raw       71,805  coded      20,763
+  msg_str    raw       65,033  coded      15,895
+  msg_skel   raw      137,535  coded      11,123
+  sig_l      raw       10,630  coded       8,220
+  msg_prop   raw       57,824  coded       6,419
+  hdr_l      raw       19,984  coded       5,723
+  bin        raw    2,787,728  coded       1,284
+  msg_r      raw        3,406  coded       1,084
+  tmpl_l     raw        2,728  coded         923
+  msg_rtf    raw       56,311  coded         581
+  path       raw          722  coded         245
+  tmpl_r     raw          472  coded         191
+  hdr_r      raw          199  coded          63
+  date       raw           39  coded          56
+  sig_r      raw          554  coded          52
+  kind       raw           44  coded          37
+  dsec       raw           14  coded          37
+  addr_r     raw           48  coded          33
+  rdate      raw           45  coded          29
+  subj_r     raw           51  coded          28
+  dfmt_r     raw           21  coded          26
+  bodyref    raw           17  coded          25
+  id_r       raw           12  coded          22
+  mid2       raw           14  coded          22
+  seg        raw            6  coded          21
+  dupref     raw            2  coded          20
+  diff       raw            6  coded          18
+  total coded 96,814  archive 97,117
+
+Transform 3.5-3.7 s, inverse transform 1.7 s (2 vCPU Xeon 2.1 GHz).
+
+Compressed RTF (PR_RTF_COMPRESSED, 23 LZFu streams with content, 120,003 bytes):
+  coded by emcm as they are (one stream)               88,849
+  stored decompressed: RTF text                       467,239 raw, about 18,800 coded (in body)
+  token choices, rank among equally long matches       48,304 raw,  9,187 coded (first attempt)
+  token choices against the simulated match finder      63,394 raw,    581 coded
+  tokens that differ from the simulation              about 370 of 63,394 (0.6%), all after the
+                                                        4 KB dictionary wrapped (before: none)
+  Outlook's finder: Okumura-style LZSS binary tree, 17-byte compare, 256 roots,
+  the first longest match on the search path wins, full matches replace the
+  old node, deletion of a node with two children by its successor (by its
+  predecessor, as in LZSS.C: 4,655 differing tokens instead of about 370);
+  no deletions once the input is exhausted.
+
+Compound-file skeleton (everything but stream content), 25 files:
+  zeroed content, zero runs only                      354,244 raw, 18,839 coded
+  field-wise (emz_msg.skeleton_encode)                137,535 raw, 11,123 coded
+    per part when coded alone: tree links 2,586, sizes 2,021, names 1,693,
+    FAT 1,121, other bytes (slack, free sectors) 1,078, start sectors 1,001,
+    CLSID/state/times 866, mini FAT 535, headers 500, type/colour 317
+  Standard red-black insertion in entry order reproduces 81 of 119 sibling
+  trees exactly (another 25 up to colours): not used yet, see docs/IMPROVEMENTS.md.
+
+RTF text against the other bodies (rtf_markup_split; runs into the body stream
+after the plain/HTML bodies, markup into msg_rtfm).  19 of the 23 RTF bodies
+wrap HTML (no separate HTML body in these files), 2 wrap plain text, 2 are
+native RTF:
+  plain bodies alone                                    7,894 coded
+  plain bodies + RTF text, one stream                  21,040 coded
+  plain bodies + RTF runs                              15,959 coded, + markup 3,494 = 19,453
+  archive, attachments zeroed                          97,117 -> 95,538
+  archive, files as they are                        2,595,994 -> 2,595,113

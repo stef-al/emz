@@ -1,0 +1,128 @@
+emz version 2 ablations (sizes in bytes; all runs compress only unless noted).
+The first part was measured with version 2 as first released (commit 37921ca), the second part
+with the current code.
+
+== Coder components on 12 MB samples of the body stream ==
+switches: EMCM_QM (quote-aware match model), EMCM_WAYS (4 = 4-way bucket search,
+2 = version 1), EMCM_SPARSE (3 = long match model indexes every 4th position,
+0 = every position), EMCM_APM2 (order-2 APM stage)
+sample                       Enron bodies (b12)   oss-security bodies (ob12)
+emcm version 1                   1,665,925          2,292,081
+emcm version 2                   1,654,768          2,247,645
+  EMCM_QM=0                      1,662,367          2,289,074
+  EMCM_WAYS=2                    1,656,074          2,249,902
+  EMCM_SPARSE=0                  1,656,124          2,248,976
+  EMCM_APM2=0                    1,656,147          2,247,791
+  all four off                   1,665,925          2,292,081   (identical to version 1)
+
+== Recent corpus (oss_full.corpus, 132,116,039 bytes) ==
+emz version 1 (every message verbatim; v1 coder)           23,049,388
+emcm version 1 alone, raw corpus                          23,062,984
+emcm version 2 alone, raw corpus                          22,822,567   (419.8 s wall)
+emz version 2 transform + emcm version 1                  20,462,115
+emz version 2 before the last three models (verified)     20,661,082   (results of an earlier frozen run)
+emz version 2 (final, verified round trip)                20,237,556
+
+== First 1,500 messages of the recent corpus (oss_s1500.corpus, 7,362,431 bytes) ==
+emz version 1                                              1,177,708
+emz version 2, header/thread/signature/MIME models          1,070,622
+  + DKIM/ARC body hash recomputed from the body            1,063,502
+  + generic fields refer to other fields and body size     1,033,767
+  + multipart boundary taken from the body                 1,024,377   (= final)
+xz -9e                                                     1,390,948
+zstd --ultra -22 --long=31                                 1,434,277
+zpaq -m5                                                   1,175,070
+emcm version 2 alone                                       1,161,681
+paq8px v217 -8                                               952,713   (1,558 s)
+emz version 2 transform + paq8px -8 on each stream           881,698   (881,490 + 208 bytes container)
+  per stream (raw -> paq8px):
+    addr_r.raw 3827 1060
+    bin.raw 58785 18074
+    body.raw 3551155 605619
+    bodyref.raw 1500 25
+    date.raw 2569 1972
+    dfmt_r.raw 4794 924
+    dsec.raw 1500 1135
+    hdr_l.raw 1297849 89564
+    hdr_r.raw 30458 3340
+    id_r.raw 6301 1698
+    kind.raw 1500 17
+    mid2.raw 1501 17
+    path.raw 1519 36
+    rdate.raw 7406 2683
+    seg.raw 9051 3466
+    sig_l.raw 197866 144392
+    sig_r.raw 1776 199
+    subj_r.raw 3860 832
+    tmpl_l.raw 5012 1705
+    tmpl_r.raw 13889 4732
+
+== Enron, 100 MB subset (s100.corpus, first 100 MB in path order) ==
+emz version 1                                              5,310,297
+emz version 1 transform + emcm version 2                   5,270,652
+emz version 2                                              5,195,569
+
+== Enron, 5 MB sample (s5b.corpus, 2,835 messages) ==
+emz version 1                                                327,403
+emz version 2                                                318,491
+emcm version 1 alone                                         357,156
+emcm version 2 alone                                         355,315
+
+== Full corpora, verified round trips of version 2 as first released ==
+oss_full.corpus  132,116,039 -> 20,237,556   sha256 1b3c992464f4f960ec4526119b826e9ec32b63db040e911ebaa1857f030bd9f8
+enron.corpus   1,437,509,559 -> 55,796,550   sha256 5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc
+
+==========================================================================
+Current version (run model and coder tuning, end marks for body text)
+==========================================================================
+
+== Coder components on the same 12 MB body samples, switched off one at a time ==
+sample                                          Enron bodies (b12)   oss bodies (ob12)
+emcm version 1                                      1,665,925          2,292,081
+emcm as first released with version 2               1,654,768          2,247,645
+emcm current                                        1,631,303          2,206,575
+  EMCM_RUN=0      (run model)                       1,641,848          2,224,948
+  EMCM_DIRECT=0   (direct order-1/2 inputs)         1,632,703          2,210,625
+  EMCM_M3SEL=0    (third mixer: prev byte x bitpos) 1,635,980          2,212,888
+  EMCM_FMIX=0     (learned final mix)               1,635,012          2,213,842
+  EMCM_CTX=0,1,2,3,4,5,6,7,8 (order 6, not 5)       1,633,189          2,208,366
+  EMCM_QM=0       (quote-aware match model)         1,639,180          2,246,611
+  EMCM_WAYS=2     (2-way bucket search)             1,632,555          2,208,644
+  EMCM_SPARSE=0   (long match model indexes all)    1,632,624          2,207,807
+  EMCM_APM2=0     (order-2 APM and final mix)       1,636,600          2,214,685
+  the five newest off (= first v2 coder; mixer      1,654,769          2,247,646
+  summation order differs)
+
+== Recent corpus (oss_full.corpus) ==
+emcm version 1 alone, raw corpus                          23,062,984
+emcm current alone, raw corpus                            22,393,093
+current transform + emcm version 1                        20,420,192
+emz current (verified round trip)                         19,924,181
+
+== Latest changes, step by step ==
+                                                Enron s100       oss first 1,500
+version 2 as first released                     5,195,569        1,024,377
++ coder changes                                 5,122,800        1,011,532
++ end marks instead of lengths for body text    5,090,615        1,008,184
+
+== Enron, 100 MB subset ==
+emz version 1 transform + current coder                    5,200,448
+emz current                                                5,090,615
+
+== Small samples ==
+s5b (Enron, 5 MB): emz current 312,383; emcm current alone 349,469
+oss_s1500 (first 1,500 recent messages): emcm current alone 1,137,837; emz current 1,008,184
+
+== Ideas measured and dropped ==
+16-bit probabilities in the arithmetic coder: b12 1,653,916 / ob12 2,247,118 against 1,654,768 / 2,247,645 (v2 coder)
+final mixer selected by the partial byte: 1,651,127 / 2,241,004 against 1,649,589 / 2,237,132 with match-state selection
+final mixer alone (no fixed average): 1,656,406 / 2,237,219
+StateMap limit 255 for the contexts: 1,655,947 / 2,247,348
+with the run model, adding word + previous byte: 1,645,716 / 2,222,190; adding word trigram: 1,639,719 / 2,211,317
+  (against 1,633,084 / 2,208,815 without); order 12 instead of 8: 1,637,213 / 2,210,406
+deflate recompression of attachments (recent corpus): of 3.35 MB of gzip/zip/PDF/PNG attachments,
+  168 KB of deflate data is reproduced exactly by zlib (levels 1-9, memLevel 8/9)
+
+== Full corpora, verified round trips of the current code ==
+oss_full.corpus  132,116,039 -> 19,924,181   sha256 1b3c992464f4f960ec4526119b826e9ec32b63db040e911ebaa1857f030bd9f8
+enron.corpus   1,437,509,559 -> 54,470,287   sha256 5e5765e00af914a0b828b57ea97f26e6800c44b907b990dd535d9d214a1e2fcc

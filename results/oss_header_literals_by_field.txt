@@ -1,0 +1,34 @@
+== hdr_l: 15,318,574 bytes, 1,934,663 coded field by field
+field                                        fields          raw       coded  share
+(other fields)                                    0    1,893,859     600,423  31.0%
+autocrypt                                       795      554,634     327,213  16.9%
+message-id                                   16,968      841,491     324,805  16.8%
+subject                                      16,967      757,955     141,149   7.3%
+x-vm-v5-data                                 11,513    5,041,946     137,288   7.1%
+x-received                                    4,798      414,660      94,666   4.9%
+received                                     33,932    1,143,389      59,870   3.1%
+dkim-signature                                8,441    1,563,420      57,956   3.0%
+from                                         16,967      409,219      48,016   2.5%
+x-ms-* / x-microsoft-* / x-forefront-*       17,077      655,993      45,332   2.3%
+to                                           16,961      299,477      28,859   1.5%
+cc                                            5,958      239,337      28,844   1.5%
+x-google-dkim-signature                       3,698    1,061,026      20,024   1.0%
+x-me-proxy-cause                                286      180,738      14,628   0.8%
+content-type                                 15,849      261,430       5,590   0.3%
+== sig_l: 7,692,008 bytes, 5,537,189 coded field by field
+field                                        fields          raw       coded  share
+dkim-signature                                8,441    2,635,610   1,942,841  35.1%
+x-ms-* / x-microsoft-* / x-forefront-*       17,077    2,274,068   1,554,127  28.1%
+x-google-dkim-signature                       3,698    1,361,519   1,020,455  18.4%
+x-gm-message-state                            4,147      453,423     319,700   5.8%
+arc-message-signature                           754      275,779     200,753   3.6%
+arc-seal                                        754      258,769     190,226   3.4%
+x-google-smtp-source                          2,412      215,580     148,042   2.7%
+x-gm-gg                                         534      195,839     145,661   2.6%
+x-gm-features                                   286       15,573      11,366   0.2%
+x-google-sender-auth                             85        1,460       1,229   0.0%
+authentication-results                        1,980        2,035       1,103   0.0%
+x-sonic-dkim-sign                                 3        1,170       1,006   0.0%
+(other fields)                                    0          472         363   0.0%
+x-google-thread-url                               8          360         164   0.0%
+x-google-message-url                              8          351         153   0.0%
