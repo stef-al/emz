@@ -19,16 +19,19 @@ quoted-printable and base64 parts are decoded when re-encoding reproduces the
 original exactly.  Messages whose content already occurred are coded as a
 reference plus a per-field difference mask.  An Outlook .msg file is split
 into its compound-file skeleton and its MAPI property streams (emz_msg.py),
-which are coded by property tag.  All decisions go to separate
+a PST or OST store into its skeleton and its data blocks (emz_pst.py); the
+property values of both are coded by property tag.  All decisions go to separate
 streams, which the context-mixing coder `emcm` compresses.  Anything that does
 not fit is stored verbatim, so the result is always byte-exact.
 """
-import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time, base64, binascii
+import os, sys, re, struct, hashlib, subprocess, tempfile, shutil, time, base64, binascii, zlib
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qp import qp_decode, qp_encode, QP_VARIANTS
 from emz_msg import (CFB_MAGIC, split as msg_split, skeleton_decode, fill as msg_fill, rtf_split, rtf_join,
                      rtf_markup_split, rtf_markup_join)
+from emz_pst import (PST_MAGIC, split as pst_split, skeleton_decode as pst_skeleton_decode, fill as pst_fill,
+                     xblock, slblock, hn_split, hn_join, hid_ref)
 
 EMCM = os.environ.get("EMCM", os.path.join(os.path.dirname(os.path.abspath(__file__)), "emcm"))
 MAGIC = b"EMZ4"
@@ -80,7 +83,8 @@ STREAMS = ["path", "kind", "dupref", "diff", "tmpl_r", "tmpl_l",
            "hdr_r", "hdr_l", "sig_r", "sig_l", "addr_r", "xal_r", "subj_r",
            "id_r", "mid1", "mid2", "date", "dsec", "dfmt_r", "rdate",
            "seg", "bodyref", "body", "bin", "raw", "env_r", "env_l", "env_d",
-           "msg_r", "msg_skel", "msg_str", "msg_bin", "msg_prop", "msg_rtf", "msg_rtfm"]
+           "msg_r", "msg_skel", "msg_str", "msg_bin", "msg_prop", "msg_rtf", "msg_rtfm",
+           "pst_skel", "pst_hn", "pst_blk"]
 
 # --------------------------------------------------------------------------
 class Recency:
@@ -557,6 +561,13 @@ class Codec:
                 self.code_msg(path, msg, parts)
                 if env is not None: self.code_envelope(env, None, None)
                 return path, msg
+        if self.enc and msg[:4] == PST_MAGIC:
+            parts = pst_split(msg)
+            if parts is not None:
+                self.S["kind"].byte(6 | 8 * (env is not None))
+                self.code_pst(path, msg, parts)
+                if env is not None: self.code_envelope(env, None, None)
+                return path, msg
         return self.code_rfc(path, msg, env)
 
     def code_rfc(self, path, msg=None, env=None):
@@ -579,8 +590,8 @@ class Codec:
         else:
             t = K.byte()
             has_env = t >= 8; t &= 7
-            if t == 3:
-                m = self.code_msg(path)
+            if t in (3, 6):
+                m = self.code_msg(path) if t == 3 else self.code_pst(path)
                 return path, m, (self.code_envelope(None, None, None) if has_env else None)
             if t == 2:
                 n = self.S["raw"].uint(); m = self.S["raw"].blob(n)
@@ -1157,15 +1168,20 @@ class Codec:
     def code_msg_stream(self, path, spath, size, sizes, v):
         if not size: return b""
         name = spath.rpartition("/")[2]
-        tag = msg_tag(name)
-        pid, typ = (tag >> 16, tag & 0xFFFF) if tag is not None else (None, None)
         if name == "__properties_version1.0":
             return self.code_props(spath, size, sizes, v)
+        return self.code_value(path, spath, msg_tag(name), size, v)
+
+    def code_value(self, path, key, tag, size, v):
+        """One property value of a .msg or PST message; tag None if not
+        known.  key selects the recency list."""
+        if not size: return b""
+        pid, typ = (tag >> 16, tag & 0xFFFF) if tag is not None else (None, None)
         if pid == 0x007D and typ in (0x1E, 0x1F):
             return self.code_transport(path, typ, size, v)
         if size >= MSG_BIG or pid in (0x1000, 0x1009, 0x1013, 0x3701):
             return self.code_msg_big(path, pid, typ, size, v)
-        v = self.code_msg_small(spath, typ, size, v)
+        v = self.code_msg_small(key, typ, size, v)
         if typ in (0x1E, 0x1F):
             t = msg_text(v) if typ == 0x1F else v
             if t is not None: self.add_known(t.rstrip(b"\0"))
@@ -1378,6 +1394,219 @@ class Codec:
                 vals.append(x)
         if self.enc: return v
         return head + b"".join(tb[4 * k:4 * k + 4] + fb[4 * k:4 * k + 4] + vals[k] for k in range(n))
+
+    # ---------------- Outlook PST / OST ----------------
+    def code_pst(self, path, data=None, parts=None):
+        """Personal store (emz_pst.py): the skeleton (which keeps internal
+        and opaque blocks in place), then the data blocks node by node in node
+        B-tree order, then the blocks no node refers to."""
+        if self.enc:
+            sk, st, stored = parts
+            self.S["pst_skel"].blob(sk)
+        else:
+            Sk = self.S["pst_skel"]
+            zeroed, st, Sk.p = pst_skeleton_decode(Sk.b, Sk.p)
+            stored = {}
+        done = set()
+        for bid in st.border:                  # internal and opaque blocks are in the skeleton
+            if st.kept(bid):
+                ib, cb, cbinf = st.blocks[bid]
+                stored[bid] = bytes(st.zeroed[ib:ib + cb]); done.add(bid)
+        self.pst = (st, stored, done)
+        for nid, bdata, bsub, parent in st.nodes:
+            self.mvals = []; self.mpos = {}; self.mknown = []; self.mrx = None
+            self.code_pst_node(path, nid & 0xFFFFFFFF, bdata, bsub, 0)
+        for bid in st.border:
+            self.pst_raw(bid)
+        return data if self.enc else pst_fill(zeroed, st, stored)
+
+    def pst_raw(self, bid):
+        """A block as it is (decoded from the permute encoding when it is a
+        plain data block)."""
+        st, stored, done = self.pst
+        if bid in done: return
+        done.add(bid)
+        if self.enc:
+            p = st.decode(bid, stored[bid])
+            self.S["pst_blk"].blob(stored[bid] if p is None else p)
+        else:
+            b = self.S["pst_blk"].blob(st.blocks[bid][1])
+            stored[bid] = b if st.opaque(bid) else st.encode(bid, b)
+
+    def pst_tree(self, bid, depth=0):
+        """Data tree -> its data blocks (internal blocks coded on the way),
+        or None if it is not a valid tree."""
+        st, stored, done = self.pst
+        if not bid: return []
+        if bid not in st.blocks or depth > 3: return None
+        if not bid & 2: return [bid]
+        self.pst_raw(bid)
+        try: x = xblock(st.inner(bid, stored[bid]))
+        except zlib.error: return None
+        if x is None: return None
+        out = []
+        for c in x[1]:
+            sub = self.pst_tree(c, depth + 1)
+            if sub is None: return None
+            out += sub
+        return out
+
+    def pst_subs(self, bid, depth=0):
+        """Subnode tree -> [(nid, data bid, subnode bid)], or None."""
+        st, stored, done = self.pst
+        if not bid: return []
+        if bid not in st.blocks or not bid & 2 or depth > 3: return None
+        self.pst_raw(bid)
+        try: x = slblock(st.inner(bid, stored[bid]))
+        except zlib.error: return None
+        if x is None: return None
+        if x[0] == 0: return x[1]
+        out = []
+        for c in x[1]:
+            sub = self.pst_subs(c, depth + 1)
+            if sub is None: return None
+            out += sub
+        return out
+
+    def code_pst_node(self, path, nid, bdata, bsub, depth):
+        """A node: its data (heap-on-node pages, property values), then its
+        subnodes: values of its properties in msg_priority order, then the
+        others (tables, attachments, embedded messages) recursively."""
+        data = self.pst_tree(bdata)
+        subs = self.pst_subs(bsub)
+        tags = self.code_pst_data(path, nid, data) if data else {}
+        if not subs or depth > 8: return
+
+        def order(k):
+            t = tags.get(subs[k][0] & 0xFFFFFFFF)
+            return (0, msg_priority("__substg1.0_%08X" % t), k) if t is not None and not subs[k][2] else (1, 0, k)
+        for k in sorted(range(len(subs)), key=order):
+            snid, sbd, sbs = subs[k]
+            t = tags.get(snid & 0xFFFFFFFF)
+            if t is not None and not sbs: self.code_pst_value(path, t, sbd)
+            else: self.code_pst_node(path, snid & 0xFFFFFFFF, sbd, sbs, depth + 1)
+
+    def pst_whole(self, data):
+        """True if the data blocks can be coded as one value."""
+        st, stored, done = self.pst
+        return data and not any(b in done or st.opaque(b) for b in data) and len(set(data)) == len(data)
+
+    def pst_put(self, data, v):
+        """Decoder: plain node data -> stored blocks."""
+        st, stored, done = self.pst
+        q = 0
+        for b in data:
+            n = st.blocks[b][1]; stored[b] = st.encode(b, v[q:q + n]); q += n
+
+    def code_pst_value(self, path, tag, bdata):
+        """A property value that lives in a subnode."""
+        st, stored, done = self.pst
+        data = self.pst_tree(bdata)
+        if not self.pst_whole(data):
+            for b in data or []: self.pst_raw(b)
+            return
+        size = sum(st.blocks[b][1] for b in data)
+        v = b"".join(st.decode(b, stored[b]) for b in data) if self.enc else None
+        v = self.code_value(path, "pst/%08X" % tag, tag, size, v)
+        if not self.enc: self.pst_put(data, v)
+        done.update(data)
+
+    def code_pst_data(self, path, nid, data):
+        """Node data: heap-on-node pages (structure into pst_hn, then the
+        allocations: a property context's B-tree first, its values by
+        property tag in msg_priority order, other allocations as values whose
+        kind (UTF-16 text or binary) is flagged), else one value.  Returns
+        {subnode NID: property tag} for the values kept in subnodes."""
+        st, stored, done = self.pst
+        R, H = self.S["msg_r"], self.S["pst_hn"]
+        if not self.pst_whole(data):
+            for b in data: self.pst_raw(b)
+            return {}
+        sizes = [st.blocks[b][1] for b in data]
+        if self.enc:
+            plains = [st.decode(b, stored[b]) for b in data]
+            pages = [hn_split(p, i) for i, p in enumerate(plains)]
+            ok = all(pg is not None and hn_join(*pg) == p for pg, p in zip(pages, plains))
+            R.byte(ok)
+        else:
+            ok = R.byte()
+        if not ok:
+            v = b"".join(plains) if self.enc else None
+            v = self.code_value(path, "pst/node/%02X" % (nid & 0x1F), None, sum(sizes), v)
+            if not self.enc: self.pst_put(data, v)
+            done.update(data)
+            return {}
+        if self.enc:
+            for hdr, nfree, allocs, gap, tail in pages:
+                H.blob(hdr); H.uint(len(allocs)); H.uint(nfree)
+                for a in allocs: H.uint(len(a))
+                H.uint(len(gap)); H.blob(gap); H.uint(len(tail)); H.blob(tail)
+            alens = [[len(a) for a in pg[2]] for pg in pages]
+        else:
+            pages, alens = [], []
+            for i in range(len(data)):
+                hdr = H.blob(12 if i == 0 else 66 if i >= 8 and (i - 8) % 128 == 0 else 2)
+                n = H.uint(); nfree = H.uint()
+                alens.append([H.uint() for _ in range(n)])
+                gap = H.blob(H.uint()); tail = H.blob(H.uint())
+                pages.append((hdr, nfree, None, gap, tail))
+        avals = {}
+
+        def valid(ref):
+            return ref is not None and ref[0] < len(alens) and ref[1] < len(alens[ref[0]])
+
+        def raw(ref):                       # an allocation that is structure
+            if ref not in avals:
+                if self.enc:
+                    v = pages[ref[0]][2][ref[1]]; H.blob(v)
+                else:
+                    v = H.blob(alens[ref[0]][ref[1]])
+                avals[ref] = v
+            return avals[ref]
+        tags, subtags = {}, {}
+        hdr0 = pages[0][0]
+        if hdr0[3] == 0xBC:                 # property context: BTH of (id, type, value or HNID)
+            ref = hid_ref(struct.unpack_from("<I", hdr0, 4)[0])
+            bh = raw(ref) if valid(ref) else b""
+            if len(bh) == 8 and bh[:3] == b"\xb5\x02\x06" and bh[3] <= 4:
+                recs, seen = [], set()
+
+                def walk(hid, lev):
+                    r = hid_ref(hid)
+                    if not valid(r) or r in seen: return
+                    seen.add(r); b = raw(r)
+                    if lev:
+                        for o in range(0, len(b) - 5, 6): walk(struct.unpack_from("<I", b, o + 2)[0], lev - 1)
+                    else:
+                        recs.extend(struct.unpack_from("<HHI", b, o) for o in range(0, len(b) - 7, 8))
+                walk(struct.unpack_from("<I", bh, 4)[0], bh[3])
+                for pid, typ, hnid in recs:
+                    if typ in (0x0001, 0x0002, 0x0003, 0x0004, 0x000A, 0x000B): continue
+                    r = hid_ref(hnid)
+                    if valid(r): tags.setdefault(r, pid << 16 | typ)
+                    elif hnid & 0x1F: subtags.setdefault(hnid, pid << 16 | typ)
+        for r in sorted(tags, key=lambda r: (msg_priority("__substg1.0_%08X" % tags[r]), r)):
+            if r not in avals:
+                n = alens[r[0]][r[1]]
+                avals[r] = self.code_value(path, "pst/%08X" % tags[r], tags[r], n,
+                                           pages[r[0]][2][r[1]] if self.enc else None)
+        for pi in range(len(alens)):
+            for ai in range(len(alens[pi])):
+                r = (pi, ai)
+                if r in avals: continue
+                if self.enc:
+                    v = pages[pi][2][ai]; t = msg_text(v) if len(v) >= 4 else None
+                    txt = t is not None and not any(c < 32 and c not in (9, 10, 13) for c in t)
+                    R.byte(txt)
+                else:
+                    v = None; txt = R.byte()
+                avals[r] = self.code_value(path, "pst/%02X/%d" % (hdr0[3], min(ai, 3)), 0x1F if txt else 0x0102,
+                                           alens[pi][ai], v)
+        if not self.enc:
+            self.pst_put(data, b"".join(hn_join(pg[0], pg[1], [avals[(pi, ai)] for ai in range(len(alens[pi]))],
+                                                pg[3], pg[4]) for pi, pg in enumerate(pages)))
+        done.update(data)
+        return subtags
 
 # --------------------------------------------------------------------------
 def iter_corpus(fn):

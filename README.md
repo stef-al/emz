@@ -1,9 +1,9 @@
 # emz — structure-aware compression of e-mail archives
 
 `emz` is a lossless compressor for mail archives (maildir and other
-directory trees, mbox files, mailing-list archives, Outlook `.msg` files) that
-models what an e-mail *is* instead of treating the archive as a flat byte
-stream. Every model checks
+directory trees, mbox files, mailing-list archives, Outlook `.msg` files and
+PST/OST stores) that models what an e-mail *is* instead of treating the
+archive as a flat byte stream. Every model checks
 that it reproduces the original bytes exactly. Anything that does not fit is
 coded as is, so the output is always a byte-exact copy, and decompression
 checks a SHA-256 of the original.
@@ -146,6 +146,52 @@ attachment bytes set to zero, the messages code to 47% less than xz -9e and
 49% less than emz did before. The 23 compressed RTF bodies (120,003 bytes) cost 581 bytes of token
 choices plus their text in the body stream.
 
+## Outlook PST and OST stores
+
+A PST (or the OST cache of an Exchange account) is a database file: a header,
+two B-trees in pages (nodes and blocks), and data blocks, each followed by a
+trailer with its size, a signature, a CRC and its ID. Message properties live
+in heap-on-node pages inside the blocks, larger values (bodies, attachments)
+in subnodes spread over several blocks. Outlook stores PST blocks with a
+byte substitution ("permute"), so text in a PST looks like noise to a
+general-purpose compressor. emz:
+
+* keeps the header and the B-tree pages, and drops every CRC and signature
+  it can recompute; a block trailer becomes one flag when it is what the
+  block predicts (all 4,961 trailers of the samples);
+* undoes the permute encoding and codes the data blocks node by node: a
+  heap-on-node page is split into its allocations, a property context's
+  B-tree tells which property each allocation and subnode holds, and the
+  values go through the same models as `.msg` properties (transport headers
+  through the RFC 5322 models, strings as UTF-8 with known strings, bodies
+  into the body stream, compressed RTF with Outlook's match finder,
+  attachments de-duplicated or coded as MIME or `.msg`);
+* keeps free space, allocation maps and block padding as they are, in file
+  order. Free space often holds older copies of blocks, which the coder
+  finds there.
+
+OST files of Outlook 2013 and later compress most blocks with deflate. Its
+output is about as large as zlib -9's, but the bytes differ from the third or
+fourth on and no zlib setting reproduces them (another deflate
+implementation), so those blocks are kept as stored. A store in which decodable data is less
+than 10% of the file keeps all its blocks in place: the property models then
+lost more (0.4%) than they won, because the plain blocks were better
+predicted from their old copies in free space.
+
+| File (samples of pst-extractor's tests) | Size | **emz** | emz before | xz -9e | zstd -19 --long |
+|---|---:|---:|---:|---:|---:|
+| `enron.pst` (Unicode PST, permute) | 13,984,768 | **10,482,836** | 10,642,857 | 10,979,820 | 10,947,595 |
+| the same with attachment bytes zeroed | 13,984,768 | **144,287** | 177,030 | 170,156 | 189,166 |
+| `mtnman1965@outlook.com.ost` (OST 2013+) | 16,818,176 | **2,512,366** | 2,527,620 | 2,516,708 | 2,520,323 |
+| `pstextractortest@outlook.com.ost` | 16,818,176 | 1,538,828 | 1,559,074 | **1,535,532** | 1,552,372 |
+
+The PST's attachments (11.8 MB, mostly already compressed) set its total.
+Without them the store codes to 18% less than emz did before and 15% less
+than xz -9e; of the rest, 41% is the skeleton, mostly free space with stale
+bytes. The OSTs are 98% compressed blocks and free space; emz gains 0.6–1.3%
+over its previous version and is level with xz. Details in
+[`results/pst_samples.txt`](results/pst_samples.txt).
+
 ## Quick start
 
 ```sh
@@ -163,8 +209,9 @@ one message; names, sub-directories and empty directories are kept, file times
 and permissions are not), an mbox file (starts with `From `), a *corpus* file
 (for each message `path\n`, `length\n`, then the raw bytes; the benchmark
 corpora use it), or any other file as a single message. A message that is an
-Outlook `.msg` file is recognised by its content, in any of these forms
-(`python3 emz.py c saved_mails/ mails.emz`).
+Outlook `.msg` file or a PST/OST store is recognised by its content, in any of
+these forms (`python3 emz.py c saved_mails/ mails.emz`,
+`python3 emz.py c archive.pst archive.emz`).
 
 The full corpora are not stored in this repository. To fetch and serialise
 them:
@@ -537,12 +584,16 @@ independently readable.
   anti-spam reports and already-compressed attachments are close to random.
   On the recent corpus they set a floor of roughly 8–9 MB, over 40% of emz's
   output.
-* **Outlook files.** `.msg` files are supported; PST and OST stores are not
-  yet (see [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md)). The RTF match
+* **Outlook files.** `.msg` files, Unicode PST files and OST files are
+  supported. ANSI PST files (Outlook 97–2002), stores with "cyclic"
+  encoding and damaged stores are coded as opaque files; OST blocks that
+  Outlook compressed are kept as stored (see
+  [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md)). The RTF match
   finder runs in Python: about 0.14 MB/s of RTF text when compressing
   (prediction plus verification) and 0.29 MB/s when decompressing.
-  The `.msg` samples are small (25 files), so the numbers above show the
-  method rather than what a large Outlook archive would give.
+  The `.msg` and PST/OST samples are small (25 files and 3 stores), so the
+  numbers above show the method rather than what a large Outlook archive
+  would give.
 
 ## Related approaches
 
@@ -658,7 +709,20 @@ stream's name and size before any content. `emz_msg.py` holds the compound
 file reader and skeleton coder and the compressed-RTF codec; `rtf_compress`
 there compresses RTF the way Outlook does.
 
-### 6. Entropy coding: `emcm`
+### 6. PST and OST stores
+
+See [Outlook PST and OST stores](#outlook-pst-and-ost-stores). `emz_pst.py`
+reads the store through a page callback, so the decoder rebuilds the B-tree
+pages from the skeleton in the order it walks them, and then knows every
+block's position and size. Node data is coded in node B-tree order: the
+data tree's and subnode tree's internal blocks first, then the node's heap
+pages (header, allocation sizes, gaps) into `pst_hn`, then a property
+context's B-tree allocations, its values by tag in the `.msg` priority order,
+the remaining allocations as values flagged as UTF-16 text or binary, and
+last the subnodes (values by tag, other nodes recursively). Blocks no node
+refers to follow as they are.
+
+### 7. Entropy coding: `emcm`
 
 `emcm.c` is a bitwise context-mixing coder in the paq/lpaq family, written for
 this project:
@@ -706,8 +770,10 @@ this project:
 | `emz.py` | parser, field and MIME models, streams, container, decoder |
 | `emcm.c` | context-mixing back end (build with `make`) |
 | `qp.py` | quoted-printable decoder and the 8 encoder variants |
-| `emz_msg.py` | Outlook `.msg`: compound-file reader, skeleton coder, compressed-RTF codec with Outlook's match finder |
-| `tests/` | unit and round-trip tests, and two sample corpora chosen to exercise every code path: `enron_sample.corpus` (564 Enron messages, 1.1 MB) and `oss_sample.corpus` (184 oss-security messages, 1.2 MB); `msgwriter.py` writes synthetic `.msg` files for the `.msg` tests |
+| `emz_msg.py` | Outlook `.msg`: compound-file reader, skeleton coder, compressed-RTF codec with Outlook's match finder, RTF text/markup split |
+| `emz_pst.py` | Outlook PST/OST: store reader, skeleton coder, block trees, heap-on-node pages |
+| `tests/` | unit and round-trip tests, and two sample corpora chosen to exercise every code path: `enron_sample.corpus` (564 Enron messages, 1.1 MB) and `oss_sample.corpus` (184 oss-security messages, 1.2 MB); `msgwriter.py` and `pstwriter.py` write synthetic `.msg` and PST files for the Outlook tests |
+| `scripts/zero_attachments.py` | zeroes the attachment data of a `.msg` or PST/OST file, for the "attachment bytes zeroed" measurements |
 | `scripts/fetch_enron.sh`, `scripts/build_corpus.py` | download the Enron corpus and build the canonical file |
 | `scripts/fetch_oss_security.sh`, `scripts/build_inbox_corpus.py` | the same for the oss-security mirror |
 | `scripts/make_sample.py`, `scripts/make_sample_modern.py` | how the test samples were selected |
@@ -736,5 +802,6 @@ states, StateMaps, logistic mixing and APM/SSE stages. The Enron corpus is
 the CMU release of 2015-05-07 by William W. Cohen and the CALO project. The
 oss-security list is run by Openwall; its messages belong to their authors.
 The `.msg` measurements used the sample files of the MSGReader (MIT) and
-msg-extractor (GPL-3.0) projects, which are not included here. The RTF match
+msg-extractor (GPL-3.0) projects, the PST/OST measurements those of
+pst-extractor (MIT); none are included here. The RTF match
 finder follows Haruhiko Okumura's LZSS.C (1989).

@@ -205,10 +205,12 @@ Together, **estimated −0.5 to −1%.**
 
 ## 8. Outlook files
 
-**Implemented: `.msg`** (see the README section and
-`results/msg_samples.txt`). On 25 sample files with attachment bytes zeroed
-the archive is 97.1 KB, against 186.2 KB for emz without `.msg` support and
-181.1 KB for xz -9e (**measured**). Where the 96.8 KB of coded streams go:
+**Implemented: `.msg`, PST and OST** (see the README sections,
+`results/msg_samples.txt` and `results/pst_samples.txt`). On 25 sample
+`.msg` files with attachment bytes zeroed the archive was 97.1 KB before the
+RTF step below (95.5 KB after), against 186.2 KB for emz without `.msg`
+support and 181.1 KB for xz -9e (**measured**). Where the 96.8 KB of coded
+streams went before that step:
 
 | Part | Coded (bytes) | Share |
 |---|---:|---:|
@@ -222,22 +224,25 @@ the archive is 97.1 KB, against 186.2 KB for emz without `.msg` support and
 
 Next steps, largest first:
 
-* **RTF against the other bodies** (**estimated**: most of the RTF's share
-  of the body stream, about 15 KB of 24 KB here). Outlook's RTF either wraps
-  the plain-text body (`\fromtext`) or the HTML body (`\fromhtml1`, the HTML
-  kept in `\*\htmltag` groups). Decoding the encapsulation and coding the RTF
-  as the operations that turn the other body into it would leave the RTF
-  boilerplate, which repeats from message to message.
-* **PST and OST stores.** The node database (pages, blocks, B-trees) is a
-  container like the compound file: blocks are "permute"-encoded (a fixed
-  byte substitution) or "cyclic"-encoded (keyed by block ID), both reversible;
-  the property contexts inside hold the same properties as a `.msg`, so the
-  value models carry over. OST files of Outlook 2013 and later store blocks
-  zlib-compressed in 4 KB pages; Python's zlib does not reproduce
-  Outlook's deflate output (tried on a sample OST), so those blocks need
-  either a deflate re-encoder that can be told the encoder's choices
-  (precomp-style) or verbatim storage. A PST of the Enron sample is in
-  pst-extractor's test data.
+* **RTF against the other bodies: implemented** (**measured**: 97,117 ->
+  95,538 bytes). The estimate was too high: 19 of the 23 sample RTF bodies
+  wrap HTML that the files do not store separately, so the HTML itself is
+  new information. What is left: the `\*\htmltagN` numbers and
+  `\htmlrtf` blocks in the markup follow from the HTML tags in the text runs.
+* **PST and OST: implemented** (README, `results/pst_samples.txt`). Next:
+  * **Outlook's deflate in OST files** (98% of the OST samples, together
+    with free space). An exact re-encoder in the style of preflate (decode
+    the deflate stream into tokens and Huffman tables, code them against a
+    reference parse) would make those blocks as compressible as the PST's.
+  * **Table contexts** (folder contents tables repeat each message's
+    subject, sender, times and flags): their rows are coded as plain
+    allocations now; coding them column by column against the messages they
+    list should remove most of them.
+  * **ANSI PST** (Outlook 97–2002; 32-bit IDs and offsets, other page and
+    trailer layouts) and the "cyclic" encoding, for which emz would need
+    the two other substitution tables of the MS-PST spec.
+  * **Free space** (41% of the PST's message part): stale bytes of deleted
+    items, as they are; undoing the permute encoding there did not help.
 * **Directory trees** (**measured**: standard red-black insertion in entry
   order reproduces 81 of 119 sibling trees exactly, another 25 up to the
   colours). Coding each entry's parent and then predicting the tree would

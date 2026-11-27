@@ -36,7 +36,8 @@ Directory layout as in those repositories (msgs/, msgs/extractor/, msgs/extracto
        58880  msgs/sender_not_found_from_exchange.msg
 
 "Attachment bytes zeroed": every __substg1.0_3701* stream (attachment data,
-7,109,827 bytes) overwritten with zeros in place; the files stay valid .msg.
+7,109,827 bytes) overwritten with zeros in place by scripts/zero_attachments.py;
+the files stay valid .msg.
 
                                      as they are   attachments zeroed
   emz (this version)                      2595994            97117
